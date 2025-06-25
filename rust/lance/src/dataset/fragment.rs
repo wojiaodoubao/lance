@@ -1246,6 +1246,71 @@ impl FileFragment {
         Ok(())
     }
 
+    pub async fn take_with_reader(&self, indices: &[u32], reader: &FragmentReader) -> Result<RecordBatch> {
+        // Re-map the indices to row ids using the deletion vector
+        let deletion_vector = self.get_deletion_vector().await?;
+        let row_ids = if let Some(deletion_vector) = deletion_vector {
+            // Naive case is O(N*M), where N = indices.len() and M = deletion_vector.len()
+            // We can do better by sorting the deletion vector and using binary search
+            // This is O(N * log M + M log M).
+            let mut sorted_deleted_ids = deletion_vector
+                .as_ref()
+                .clone()
+                .into_iter()
+                .collect::<Vec<_>>();
+            sorted_deleted_ids.sort();
+
+            let mut row_ids = indices.to_vec();
+            for row_id in row_ids.iter_mut() {
+                // We find the number of deleted rows that are less than each row
+                // index, and that becomes the initial offset. We increment the
+                // index by that amount, plus the number of deleted row ids we
+                // encounter along the way. So for example, if deleted rows are
+                // [2, 3, 5] and we want row 4, we need to advanced by 2 (since
+                // 2 and 3 are less than 4). That puts us at row 6, but since
+                // we passed row 5, we need to advance by 1 more, giving a final
+                // row id of 7.
+                let mut new_row_id = *row_id;
+                let offset = sorted_deleted_ids.partition_point(|v| *v <= new_row_id);
+
+                let mut deletion_i = offset;
+                let mut i = 0;
+                while i < offset {
+                    // Advance the row id
+                    new_row_id += 1;
+                    while deletion_i < sorted_deleted_ids.len()
+                        && sorted_deleted_ids[deletion_i] == new_row_id
+                    {
+                        // If we encounter a deleted row, we need to advance
+                        // again.
+                        deletion_i += 1;
+                        new_row_id += 1;
+                    }
+                    i += 1;
+                }
+
+                *row_id = new_row_id;
+            }
+
+            Cow::Owned(row_ids)
+        } else {
+            Cow::Borrowed(indices)
+        };
+
+        // Then call take rows
+        self.take_rows_with_reader(&row_ids, reader).await
+    }
+
+    pub async fn create_reader(&self, projection: &Schema) -> Result<FragmentReader> {
+        let reader = self
+            .open(
+                projection,
+                FragReadConfig::default().with_row_address(false),
+            )
+            .await?;
+        Ok(reader)
+    }
+
     /// Take rows from this fragment based on the offset in the file.
     ///
     /// This will always return the same number of rows as the input indices.
@@ -1335,6 +1400,22 @@ impl FileFragment {
         Ok(file_metadata)
     }
 
+    pub(crate) async fn take_rows_with_reader(
+        &self,
+        row_offsets: &[u32],
+        reader: &FragmentReader,
+    ) -> Result<RecordBatch> {
+        if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
+            let range =
+                (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
+            reader.legacy_read_range_as_batch(range).await
+        } else {
+            // FIXME, change this method to streams
+            reader.take_as_batch(row_offsets, None).await
+        }
+    }
+
+
     /// Take rows based on internal local row offsets
     ///
     /// If the row offsets are out-of-bounds, this will return an error. But if the
@@ -1357,14 +1438,7 @@ impl FileFragment {
             )
             .await?;
 
-        if row_offsets.len() > 1 && Self::row_ids_contiguous(row_offsets) {
-            let range =
-                (row_offsets[0] as usize)..(row_offsets[row_offsets.len() - 1] as usize + 1);
-            reader.legacy_read_range_as_batch(range).await
-        } else {
-            // FIXME, change this method to streams
-            reader.take_as_batch(row_offsets, None).await
-        }
+        self.take_rows_with_reader(row_offsets, &reader).await
     }
 
     fn row_ids_contiguous(row_ids: &[u32]) -> bool {

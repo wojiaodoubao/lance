@@ -354,9 +354,11 @@ fn fragment_take(
             "{version_name} Random Take Fragment({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
             b.to_async(rt).iter(|| async {
+                let reader = fragment.create_reader(dataset.schema()).await.unwrap();
+
                 let rows_list = rows_gen(num_batches, file_size, num_rows);
                 for rows in rows_list {
-                    let _ = fragment.take(rows.as_slice(), dataset.schema()).await;
+                    let _ = fragment.take_with_reader(&rows, &reader).await;
                 }
             })
         });
