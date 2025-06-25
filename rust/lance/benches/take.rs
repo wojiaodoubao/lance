@@ -154,15 +154,14 @@ fn bench_random_batch_take_with_file_reader(c: &mut Criterion) {
         "V2_0 Batch",
         rows_gen.clone(),
     );
-    file_reader_take(
-        c,
-        &rt,
-        file_size,
-        num_batches,
-        LanceFileVersion::V2_1,
-        "V2_1 Batch",
-        rows_gen,
-    );
+    // file_reader_take(
+    //     c,
+    //     &rt,
+    //     file_size,
+    //     num_batches,
+    //     LanceFileVersion::V2_1,
+    //     "V2_1",
+    // );
 }
 
 fn file_reader_take(
@@ -307,15 +306,14 @@ fn bench_random_batch_take_with_file_fragment(c: &mut Criterion) {
         "V2_0 Batch",
         rows_gen.clone(),
     );
-    fragment_take(
-        c,
-        &rt,
-        file_size,
-        num_batches,
-        LanceFileVersion::V2_1,
-        "V2_1 Batch",
-        rows_gen,
-    );
+    // fragment_take(
+    //     c,
+    //     &rt,
+    //     file_size,
+    //     num_batches,
+    //     LanceFileVersion::V2_1,
+    //     "V2_1",
+    // );
 }
 
 fn fragment_take(
@@ -437,5 +435,5 @@ criterion_group!(
 criterion_group!(
     name=benches;
     config = Criterion::default().significance_level(0.1).sample_size(10);
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader);
 criterion_main!(benches);
