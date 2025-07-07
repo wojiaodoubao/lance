@@ -28,6 +28,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const BATCH_SIZE: u64 = 1024;
+lazy_static::lazy_static! {
+    pub static ref DATASET_BASE_PATH : String = std::env::var("DATASET_BASE_PATH")
+                .unwrap_or("memory://base".to_string());
+}
+
+fn dataset_path() -> String {
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let base: &str = &DATASET_BASE_PATH;
+    format!("{:?}/{}", base, uuid)
+}
 
 fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
     let mut rng = rand::thread_rng();
@@ -73,7 +83,7 @@ fn dataset_take(
     version_name: &str,
 ) {
     let dataset = rt.block_on(create_dataset(
-        "memory://test.lance",
+        &dataset_path(),
         version,
         num_batches as i32,
         file_size as i32,
@@ -122,15 +132,15 @@ fn bench_random_single_take_with_file_reader(c: &mut Criterion) {
         "V2_0 Single",
         rows_gen.clone(),
     );
-    file_reader_take(
-        c,
-        &rt,
-        file_size,
-        num_batches,
-        LanceFileVersion::V2_1,
-        "V2_1 Single",
-        rows_gen,
-    );
+    // file_reader_take(
+    //     c,
+    //     &rt,
+    //     file_size,
+    //     num_batches,
+    //     LanceFileVersion::V2_1,
+    //     "V2_1 Single",
+    //     rows_gen,
+    // );
 }
 
 fn bench_random_batch_take_with_file_reader(c: &mut Criterion) {
@@ -177,7 +187,7 @@ fn file_reader_take(
     let (dataset, file_path) = rt.block_on(async {
         // Make sure there is only one fragment.
         let dataset = create_dataset(
-            "memory://test.lance",
+            &dataset_path(),
             version,
             num_batches as i32,
             file_size as i32,
@@ -195,7 +205,7 @@ fn file_reader_take(
     });
 
     // Bench random take.
-    for num_rows in [1, 10, 100, 1000] {
+    for num_rows in [1, 1000] {
         c.bench_function(&format!(
             "{version_name} Random Take FileReader({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
@@ -274,15 +284,15 @@ fn bench_random_single_take_with_file_fragment(c: &mut Criterion) {
         "V2_0 Single",
         rows_gen.clone(),
     );
-    fragment_take(
-        c,
-        &rt,
-        file_size,
-        num_batches,
-        LanceFileVersion::V2_1,
-        "V2_1 Single",
-        rows_gen,
-    );
+    // fragment_take(
+    //     c,
+    //     &rt,
+    //     file_size,
+    //     num_batches,
+    //     LanceFileVersion::V2_1,
+    //     "V2_1 Single",
+    //     rows_gen,
+    // );
 }
 
 fn bench_random_batch_take_with_file_fragment(c: &mut Criterion) {
@@ -328,7 +338,7 @@ fn fragment_take(
     rows_gen: Box<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
 ) {
     let dataset = rt.block_on(create_dataset(
-        "memory://test.lance",
+        &dataset_path(),
         version,
         num_batches as i32,
         file_size as i32,
@@ -339,7 +349,7 @@ fn fragment_take(
     let fragment = fragments.first().unwrap();
 
     // Bench random take.
-    for num_rows in [1, 10, 100, 1000] {
+    for num_rows in [1, 1000] {
         c.bench_function(&format!(
             "{version_name} Random Take Fragment({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
@@ -429,10 +439,10 @@ criterion_group!(
     name=benches;
     config = Criterion::default()
         .significance_level(0.01)
-        .sample_size(10000)
+        .sample_size(1000)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
