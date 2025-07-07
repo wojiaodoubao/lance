@@ -23,11 +23,24 @@ use object_store::path::Path;
 #[cfg(target_os = "linux")]
 use pprof::criterion::{Output, PProfProfiler};
 use rand::Rng;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 #[cfg(target_os = "linux")]
 use std::time::Duration;
 
 const BATCH_SIZE: u64 = 1024;
+
+pub static DATASET_BASE_PATH: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("DATASET_BASE_PATH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or("memory://base".to_string())
+});
+
+fn dataset_path() -> String {
+    let uuid = uuid::Uuid::new_v4().to_string();
+    let base: &str = &DATASET_BASE_PATH;
+    format!("{:?}/{}", base, uuid)
+}
 
 fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {
     let mut rng = rand::thread_rng();
@@ -73,7 +86,7 @@ fn dataset_take(
     version_name: &str,
 ) {
     let dataset = rt.block_on(create_dataset(
-        "memory://test.lance",
+        &dataset_path(),
         version,
         num_batches as i32,
         file_size as i32,
@@ -176,7 +189,7 @@ fn file_reader_take(
     let (dataset, file_path) = rt.block_on(async {
         // Make sure there is only one fragment.
         let dataset = create_dataset(
-            "memory://test.lance",
+            &dataset_path(),
             version,
             num_batches as i32,
             file_size as i32,
@@ -326,7 +339,7 @@ fn fragment_take(
     rows_gen: Box<dyn Fn(u64, u64, usize) -> Vec<Vec<u32>>>,
 ) {
     let dataset = rt.block_on(create_dataset(
-        "memory://test.lance",
+        &dataset_path(),
         version,
         num_batches as i32,
         file_size as i32,
