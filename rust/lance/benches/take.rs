@@ -122,15 +122,15 @@ fn bench_random_single_take_with_file_reader(c: &mut Criterion) {
         "V2_0 Single",
         rows_gen.clone(),
     );
-    file_reader_take(
-        c,
-        &rt,
-        file_size,
-        num_batches,
-        LanceFileVersion::V2_1,
-        "V2_1 Single",
-        rows_gen,
-    );
+    // file_reader_take(
+    //     c,
+    //     &rt,
+    //     file_size,
+    //     num_batches,
+    //     LanceFileVersion::V2_1,
+    //     "V2_1 Single",
+    //     rows_gen,
+    // );
 }
 
 fn bench_random_batch_take_with_file_reader(c: &mut Criterion) {
@@ -194,7 +194,7 @@ fn file_reader_take(
     });
 
     // Bench random take.
-    for num_rows in [1, 10, 100, 1000] {
+    for num_rows in [1000] {
         c.bench_function(&format!(
             "{version_name} Random Take FileReader({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
@@ -273,15 +273,15 @@ fn bench_random_single_take_with_file_fragment(c: &mut Criterion) {
         "V2_0 Single",
         rows_gen.clone(),
     );
-    fragment_take(
-        c,
-        &rt,
-        file_size,
-        num_batches,
-        LanceFileVersion::V2_1,
-        "V2_1 Single",
-        rows_gen,
-    );
+    // fragment_take(
+    //     c,
+    //     &rt,
+    //     file_size,
+    //     num_batches,
+    //     LanceFileVersion::V2_1,
+    //     "V2_1 Single",
+    //     rows_gen,
+    // );
 }
 
 fn bench_random_batch_take_with_file_fragment(c: &mut Criterion) {
@@ -337,7 +337,7 @@ fn fragment_take(
     let fragment = fragments.first().unwrap();
 
     // Bench random take.
-    for num_rows in [1, 10, 100, 1000] {
+    for num_rows in [1000] {
         c.bench_function(&format!(
             "{version_name} Random Take Fragment({file_size} file size, {num_batches} batches, {num_rows} rows per take)"
         ), |b| {
@@ -427,10 +427,10 @@ criterion_group!(
     name=benches;
     config = Criterion::default()
         .significance_level(0.01)
-        .sample_size(10000)
+        .sample_size(100)
         .warm_up_time(Duration::from_secs_f32(3.0))
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_random_take_with_dataset, bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader, bench_random_batch_take_with_file_fragment, bench_random_batch_take_with_file_reader);
+    targets = bench_random_single_take_with_file_fragment, bench_random_single_take_with_file_reader);
 #[cfg(not(target_os = "linux"))]
 criterion_group!(
     name=benches;
