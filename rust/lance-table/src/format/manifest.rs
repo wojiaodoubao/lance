@@ -622,7 +622,7 @@ pub trait SelfDescribingFileReader {
         Self: Sized,
     {
         let reader = object_store.open(path).await?;
-        Self::try_new_self_described_from_reader(reader.into(), cache).await
+        Self::try_new_self_described_from_reader(reader, cache).await
     }
 
     async fn try_new_self_described_from_reader(

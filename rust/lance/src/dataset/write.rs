@@ -1047,7 +1047,7 @@ mod tests {
         let path = base_path
             .child(DATA_DIR)
             .child(fragment.files[0].path.as_str());
-        let file_reader: Arc<dyn Reader> = object_store.open(&path).await.unwrap().into();
+        let file_reader = object_store.open(&path).await.unwrap();
         let reader = FileReader::try_new_from_reader(
             &path,
             file_reader,

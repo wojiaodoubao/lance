@@ -244,7 +244,7 @@ impl DatasetBuilder {
             Some(store) => Ok((
                 Arc::new(ObjectStore::new(
                     store.0.clone(),
-                    store.1.clone(),
+                    store.1.scheme(),
                     self.options.block_size,
                     self.options.object_store_wrapper,
                     self.options.use_constant_size_upload_parts,

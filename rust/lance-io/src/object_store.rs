@@ -3,11 +3,12 @@
 
 //! Extend [object_store::ObjectStore] functionalities
 
+use std::cmp::min;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use chrono::{DateTime, Utc};
 use deepsize::DeepSizeOf;
 use futures::{future, stream::BoxStream, StreamExt, TryStreamExt};
 use futures::{FutureExt, Stream};
+use moka::future::Cache;
 use lance_core::error::LanceOptionExt;
 use lance_core::utils::parse::str_is_truthy;
 use list_retry::ListRetryStream;
@@ -56,6 +58,13 @@ pub static DEFAULT_MAX_IOP_SIZE: std::sync::LazyLock<u64> = std::sync::LazyLock:
     std::env::var("LANCE_MAX_IOP_SIZE")
         .map(|val| val.parse().unwrap())
         .unwrap_or(16 * 1024 * 1024)
+});
+
+pub static OBJECT_READER_CACHE_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("OBJECT_READER_CACHE_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0)
 });
 
 pub const DEFAULT_DOWNLOAD_RETRY_COUNT: usize = 3;
@@ -120,6 +129,8 @@ pub struct ObjectStore {
     io_parallelism: usize,
     /// Number of times to retry a failed download
     download_retry_count: usize,
+    /// Object reader cache. Currently, it only caches LocalObjectReader.
+    reader_cache: Option<Arc<Cache<String, Arc<dyn Reader>>>>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -322,16 +333,16 @@ impl ObjectStore {
             if let Some(wrapper) = params.object_store_wrapper.as_ref() {
                 inner = wrapper.wrap(inner);
             }
-            let store = Self {
+            let store = Self::new(
                 inner,
-                scheme: path.scheme().to_string(),
-                block_size: params.block_size.unwrap_or(64 * 1024),
-                max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-                use_constant_size_upload_parts: params.use_constant_size_upload_parts,
-                list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or_default(),
-                io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-                download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
-            };
+                path.scheme(),
+                Some(params.block_size.unwrap_or(64 * 1024)),
+                None,
+                params.use_constant_size_upload_parts,
+                params.list_is_lexically_ordered.unwrap_or_default(),
+                DEFAULT_CLOUD_IO_PARALLELISM,
+                DEFAULT_DOWNLOAD_RETRY_COUNT,
+            );
             let path = Path::from(path.path());
             return Ok((Arc::new(store), path));
         }
@@ -406,10 +417,21 @@ impl ObjectStore {
     ///
     /// Parameters
     /// - ``path``: Absolute path to the file.
-    pub async fn open(&self, path: &Path) -> Result<Box<dyn Reader>> {
+    pub async fn open(&self, path: &Path) -> Result<Arc<dyn Reader>> {
         match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size, None).await,
-            _ => Ok(Box::new(CloudObjectReader::new(
+            "file" => {
+                if let Some(reader_cache) = self.reader_cache.as_ref() {
+                    if let Some(reader) = reader_cache.get(path.as_ref()).await {
+                        return Ok(reader);
+                    }
+                    let reader = LocalObjectReader::open(path, self.block_size, None).await?;
+                    reader_cache.insert(path.as_ref().to_string(), reader.clone()).await;
+                    Ok(reader)
+                } else {
+                    LocalObjectReader::open(path, self.block_size, None).await
+                }
+            }
+            _ => Ok(Arc::new(CloudObjectReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.block_size,
@@ -424,11 +446,11 @@ impl ObjectStore {
     /// This size may either have been retrieved from a list operation or
     /// cached metadata. By passing in the known size, we can skip a HEAD / metadata
     /// call.
-    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Box<dyn Reader>> {
+    pub async fn open_with_size(&self, path: &Path, known_size: usize) -> Result<Arc<dyn Reader>> {
         // If we know the file is really small, we can read the whole thing
         // as a single request.
         if known_size <= self.block_size {
-            return Ok(Box::new(SmallReader::new(
+            return Ok(Arc::new(SmallReader::new(
                 self.inner.clone(),
                 path.clone(),
                 self.download_retry_count,
@@ -436,16 +458,7 @@ impl ObjectStore {
             )));
         }
 
-        match self.scheme.as_str() {
-            "file" => LocalObjectReader::open(path, self.block_size, Some(known_size)).await,
-            _ => Ok(Box::new(CloudObjectReader::new(
-                self.inner.clone(),
-                path.clone(),
-                self.block_size,
-                Some(known_size),
-                self.download_retry_count,
-            )?)),
-        }
+        self.open(path).await
     }
 
     /// Create an [ObjectWriter] from local [std::path::Path]
@@ -457,7 +470,7 @@ impl ObjectStore {
     }
 
     /// Open an [Reader] from local [std::path::Path]
-    pub async fn open_local(path: &std::path::Path) -> Result<Box<dyn Reader>> {
+    pub async fn open_local(path: &std::path::Path) -> Result<Arc<dyn Reader>> {
         let object_store = Self::local();
         let absolute_path = expand_path(path.to_string_lossy())?;
         let os_path = Path::from_absolute_path(absolute_path)?;
@@ -676,7 +689,7 @@ impl ObjectStore {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<DynObjectStore>,
-        location: Url,
+        scheme: &str,
         block_size: Option<usize>,
         wrapper: Option<Arc<dyn WrappingObjectStore>>,
         use_constant_size_upload_parts: bool,
@@ -684,12 +697,25 @@ impl ObjectStore {
         io_parallelism: usize,
         download_retry_count: usize,
     ) -> Self {
-        let scheme = location.scheme();
         let block_size = block_size.unwrap_or_else(|| infer_block_size(scheme));
 
         let store = match wrapper {
             Some(wrapper) => wrapper.wrap(store),
             None => store,
+        };
+
+        let reader_cache_size: u64 = match scheme {
+            "file" => *OBJECT_READER_CACHE_SIZE,
+            _ => 0
+        };
+        let reader_cache = match reader_cache_size {
+            0 => None,
+            reader_cache_size => Some(Arc::new(
+                Cache::builder()
+                    .max_capacity(reader_cache_size)
+                    .support_invalidation_closures()
+                    .build(),
+            )),
         };
 
         Self {
@@ -701,6 +727,7 @@ impl ObjectStore {
             list_is_lexically_ordered,
             io_parallelism,
             download_retry_count,
+            reader_cache
         }
     }
 }

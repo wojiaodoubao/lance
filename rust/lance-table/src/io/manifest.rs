@@ -331,7 +331,7 @@ mod test {
         file_writer.finish_with_metadata(&metadata).await.unwrap();
 
         let reader = store.open(&path).await.unwrap();
-        let reader = FileReader::try_new_self_described_from_reader(reader.into(), None)
+        let reader = FileReader::try_new_self_described_from_reader(reader, None)
             .await
             .unwrap();
         let schema = ArrowSchema::from(reader.schema());

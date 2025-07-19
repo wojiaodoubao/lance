@@ -633,7 +633,7 @@ pub(crate) async fn open_vector_index_v2(
             let options = HNSWIndexOptions { use_residual: true };
             let hnsw = HNSWIndex::<ProductQuantizer>::try_new(
                 reader.object_reader.clone(),
-                aux_reader.into(),
+                aux_reader,
                 options,
             )
             .await?;
@@ -664,7 +664,7 @@ pub(crate) async fn open_vector_index_v2(
 
             let hnsw = HNSWIndex::<ScalarQuantizer>::try_new(
                 reader.object_reader.clone(),
-                aux_reader.into(),
+                aux_reader,
                 options,
             )
             .await?;

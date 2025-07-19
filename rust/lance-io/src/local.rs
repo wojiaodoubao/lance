@@ -100,7 +100,7 @@ impl LocalObjectReader {
         path: impl AsRef<std::path::Path>,
         block_size: usize,
         known_size: Option<usize>,
-    ) -> Result<Box<dyn Reader>> {
+    ) -> Result<Arc<dyn Reader>> {
         let path = path.as_ref().to_owned();
         let object_store_path = Path::from_filesystem_path(&path)?;
         Self::open(&object_store_path, block_size, known_size).await
@@ -112,7 +112,7 @@ impl LocalObjectReader {
         path: &Path,
         block_size: usize,
         known_size: Option<usize>,
-    ) -> Result<Box<dyn Reader>> {
+    ) -> Result<Arc<dyn Reader>> {
         let path = path.clone();
         let local_path = to_local_path(&path);
         tokio::task::spawn_blocking(move || {
@@ -124,12 +124,12 @@ impl LocalObjectReader {
                 _ => e.into(),
             })?;
             let size = OnceCell::new_with(known_size);
-            Ok(Box::new(Self {
+            Ok(Arc::new(Self {
                 file: Arc::new(file),
                 block_size,
                 size,
                 path,
-            }) as Box<dyn Reader>)
+            }) as Arc<dyn Reader>)
         })
         .await?
     }

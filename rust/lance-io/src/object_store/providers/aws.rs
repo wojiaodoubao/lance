@@ -96,16 +96,16 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .with_region(region);
         let inner = Arc::new(builder.build()?);
 
-        Ok(ObjectStore {
+        Ok(ObjectStore::new(
             inner,
-            scheme: String::from(base_path.scheme()),
-            block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
+            base_path.scheme(),
+            Some(block_size),
+            None,
             use_constant_size_upload_parts,
-            list_is_lexically_ordered: !is_s3_express,
-            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+            !is_s3_express,
+            DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
-        })
+        ))
     }
 }
 

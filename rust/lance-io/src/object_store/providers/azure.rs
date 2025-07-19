@@ -43,16 +43,16 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
         }
         let inner = Arc::new(builder.build()?);
 
-        Ok(ObjectStore {
+        Ok(ObjectStore::new(
             inner,
-            scheme: String::from("az"),
-            block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: true,
-            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
+            "az",
+            Some(block_size),
+            None,
+            false,
+            true,
+            DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
-        })
+        ))
     }
 }
 

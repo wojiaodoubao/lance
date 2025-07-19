@@ -1466,7 +1466,7 @@ pub(crate) async fn remap_index_file(
     let old_path = dataset.indices_dir().child(old_uuid).child(INDEX_FILE_NAME);
     let new_path = dataset.indices_dir().child(new_uuid).child(INDEX_FILE_NAME);
 
-    let reader: Arc<dyn Reader> = object_store.open(&old_path).await?.into();
+    let reader = object_store.open(&old_path).await?;
     let mut writer = object_store.create(&new_path).await?;
 
     let tasks = generate_remap_tasks(&index.ivf.offsets, &index.ivf.lengths)?;

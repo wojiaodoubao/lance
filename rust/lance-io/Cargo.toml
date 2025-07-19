@@ -46,6 +46,7 @@ tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
+moka.workspace = true
 async-priority-channel = "0.2.0"
 
 [dev-dependencies]

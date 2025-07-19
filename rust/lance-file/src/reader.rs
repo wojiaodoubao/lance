@@ -97,7 +97,7 @@ impl FileReader {
 
         Self::try_new_from_reader(
             path,
-            object_reader.into(),
+            object_reader,
             Some(metadata),
             schema,
             fragment_id,

@@ -4467,6 +4467,7 @@ dependencies = [
  "lance-core",
  "log",
  "mockall",
+ "moka",
  "object_store",
  "object_store_opendal",
  "opendal",

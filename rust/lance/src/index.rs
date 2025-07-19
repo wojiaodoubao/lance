@@ -1021,7 +1021,7 @@ impl DatasetIndexInternalExt for Dataset {
         let fri = self.open_frag_reuse_index(metrics).await?;
         let index_dir = self.indices_dir().child(uuid);
         let index_file = index_dir.child(INDEX_FILE_NAME);
-        let reader: Arc<dyn Reader> = self.object_store.open(&index_file).await?.into();
+        let reader = self.object_store.open(&index_file).await?;
 
         let tailing_bytes = read_last_block(reader.as_ref()).await?;
         let (major_version, minor_version) = read_version(&tailing_bytes)?;

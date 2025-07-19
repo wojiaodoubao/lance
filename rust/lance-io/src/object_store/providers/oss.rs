@@ -90,16 +90,16 @@ impl ObjectStoreProvider for OssStoreProvider {
             url.set_path(&format!("{}/", url.path()));
         }
 
-        Ok(ObjectStore {
-            scheme: "oss".to_string(),
-            inner: opendal_store,
-            block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-            use_constant_size_upload_parts: params.use_constant_size_upload_parts,
-            list_is_lexically_ordered: params.list_is_lexically_ordered.unwrap_or(true),
-            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count: storage_options.download_retry_count(),
-        })
+        Ok(ObjectStore::new(
+            opendal_store,
+            "oss",
+            Some(block_size),
+            None,
+            params.use_constant_size_upload_parts,
+            params.list_is_lexically_ordered.unwrap_or(true),
+            DEFAULT_CLOUD_IO_PARALLELISM,
+            storage_options.download_retry_count(),
+        ))
     }
 }
 

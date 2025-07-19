@@ -22,16 +22,16 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let block_size = params.block_size.unwrap_or(DEFAULT_LOCAL_BLOCK_SIZE);
         let storage_options = StorageOptions(params.storage_options.clone().unwrap_or_default());
         let download_retry_count = storage_options.download_retry_count();
-        Ok(ObjectStore {
-            inner: Arc::new(InMemory::new()),
-            scheme: String::from("memory"),
-            block_size,
-            max_iop_size: *DEFAULT_MAX_IOP_SIZE,
-            use_constant_size_upload_parts: false,
-            list_is_lexically_ordered: true,
-            io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
-            download_retry_count,
-        })
+        Ok(ObjectStore::new(
+            Arc::new(InMemory::new()),
+            "memory",
+            Some(block_size),
+            None,
+            false,
+            true,
+            DEFAULT_CLOUD_IO_PARALLELISM,
+            download_retry_count)
+        )
     }
 
     fn extract_path(&self, url: &Url) -> Path {

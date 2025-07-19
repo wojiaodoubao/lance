@@ -3950,6 +3950,7 @@ dependencies = [
  "lance-arrow",
  "lance-core",
  "log",
+ "moka",
  "object_store",
  "object_store_opendal",
  "opendal",
