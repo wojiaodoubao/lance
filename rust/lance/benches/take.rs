@@ -39,7 +39,9 @@ pub static DATASET_BASE_PATH: LazyLock<String> = LazyLock::new(|| {
 fn dataset_path() -> String {
     let uuid = uuid::Uuid::new_v4().to_string();
     let base: &str = &DATASET_BASE_PATH;
-    format!("{:?}/{}", base, uuid)
+    let path = format!("{}/{}", base, uuid);
+    println!("{}", path);
+    path
 }
 
 fn gen_ranges(num_rows: u64, file_size: u64, n: usize) -> Vec<u64> {

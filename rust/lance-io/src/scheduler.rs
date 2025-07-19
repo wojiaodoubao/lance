@@ -1111,7 +1111,7 @@ mod tests {
             });
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
-            Url::parse("mem://").unwrap(),
+            "mem://",
             Some(500),
             None,
             false,
@@ -1200,7 +1200,7 @@ mod tests {
             });
         let obj_store = Arc::new(ObjectStore::new(
             Arc::new(obj_store),
-            Url::parse("mem://").unwrap(),
+            "mem://",
             Some(500),
             None,
             false,
