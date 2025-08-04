@@ -3,11 +3,15 @@
 
 use crate::datafusion::LanceTableProvider;
 use crate::Dataset;
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::prelude::SessionContext;
 use std::sync::Arc;
+use arrow_schema::DataType;
+use datafusion::logical_expr::Volatility;
+use datafusion_expr::create_udf;
+use datafusion_functions::utils::make_scalar_function;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
 #[derive(Clone, Debug)]
@@ -74,8 +78,59 @@ impl SqlQueryBuilder {
                 row_addr,
             )),
         )?;
+        Self::register_contains(&ctx);
+
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
+    }
+
+    fn register_contains(ctx: &SessionContext) {
+        let contains_fn = Arc::new(make_scalar_function(|args: &[ArrayRef]| {
+            let column = args[0]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(datafusion::error::DataFusionError::Execution(
+                    "Function contains and contains_tokens first argument must be a StringArray".to_string(),
+                ))?;
+            let scalar_str = args[1]
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or(datafusion::error::DataFusionError::Execution(
+                    "Function contains and contains_tokens second argument must be a StringArray".to_string(),
+                ))?;
+            println!("arg0={:?}", column);
+            println!("arg1={:?}", scalar_str);
+
+            let result = column.iter().enumerate().map(|(i, column)| {
+                match column {
+                    Some(value) => Some(value.contains(scalar_str.value(i))),
+                    _ => None,
+                }
+            });
+
+            Ok(Arc::new(BooleanArray::from_iter(result)) as ArrayRef)
+        }, vec![]));
+
+
+        // Register contains function, which uses ngram index if any
+        let contains_udf = create_udf(
+            "contains_udf",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Immutable,
+            contains_fn.clone(),
+        );
+        ctx.register_udf(contains_udf);
+
+        // Register contains_tokens function, which uses fts index if any
+        let contains_udf = create_udf(
+            "contains_tokens",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Immutable,
+            contains_fn,
+        );
+        ctx.register_udf(contains_udf);
     }
 }
 
@@ -132,11 +187,19 @@ impl SqlQuery {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
-    use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray, StringArrayType};
+    use arrow_array::types::{GenericStringType, Int32Type, Int64Type, UInt64Type, Utf8Type};
+    use arrow_schema::{DataType, Field, Schema};
+    use itertools::Itertools;
     use lance_datagen::{array, gen};
+    use lance_index::{DatasetIndexExt, IndexType};
+    use lance_index::scalar::ScalarIndexParams;
+    use crate::Dataset;
+    use crate::dataset::WriteParams;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -254,5 +317,55 @@ mod tests {
         let plan = builder.into_explain_plan(true, false).await.unwrap();
 
         assert!(plan.contains("Aggregate") || plan.contains("SUM"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_contains() {
+        let text_col = Arc::new(StringArray::from(vec!["a cat", "lovely cat", "white cat", "catch up", "fish"]));
+
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+            vec![text_col.clone()],
+        )
+            .unwrap();
+        let schema_ref = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema_ref);
+        let mut dataset = Dataset::write(
+            stream,
+            "memory://test/table",
+            Some(WriteParams {
+                max_rows_per_file: 1_000, // 6 files
+                ..Default::default()
+            }),
+        )
+            .await
+            .unwrap();
+
+        let results = dataset
+            .sql("select * from foo where contains_udf(text, 'cat')")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+        println!("{:?}", results);
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+        let values = results.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let mut values: Vec<String> = (0..values.len())
+            .filter_map(|i| {
+                Some(values.value(i).to_string())
+            })
+            .collect();
+        values.sort();
+        pretty_assertions::assert_eq!(values, vec!["a cat", "catch up", "lovely cat", "white cat"]);
+
+
+        dataset.create_index(&["text"], IndexType::NGram, None, &ScalarIndexParams::default(), false).await.unwrap();
+
+
     }
 }
