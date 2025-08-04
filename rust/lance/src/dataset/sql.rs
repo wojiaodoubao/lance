@@ -3,10 +3,14 @@
 
 use crate::datafusion::LanceTableProvider;
 use crate::Dataset;
-use arrow_array::{Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, StringArray};
+use arrow_schema::DataType;
 use datafusion::dataframe::DataFrame;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::Volatility;
 use datafusion::prelude::SessionContext;
+use datafusion_expr::create_udf;
+use datafusion_functions::utils::make_scalar_function;
 use std::sync::Arc;
 
 /// A SQL builder to prepare options for running SQL queries against a Lance dataset.
@@ -74,8 +78,47 @@ impl SqlQueryBuilder {
                 row_addr,
             )),
         )?;
+
+        Self::register_contains_tokens(&ctx);
+
         let df = ctx.sql(&self.sql).await?;
         Ok(SqlQuery::new(df))
+    }
+
+    fn register_contains_tokens(ctx: &SessionContext) {
+        let function = Arc::new(make_scalar_function(
+            |args: &[ArrayRef]| {
+                let column = args[0].as_any().downcast_ref::<StringArray>().ok_or(
+                    datafusion::error::DataFusionError::Execution(
+                        "Function contains_tokens first argument must be a StringArray".to_string(),
+                    ),
+                )?;
+                let scalar_str = args[1].as_any().downcast_ref::<StringArray>().ok_or(
+                    datafusion::error::DataFusionError::Execution(
+                        "Function contains_tokens second argument must be a StringArray"
+                            .to_string(),
+                    ),
+                )?;
+
+                let result = column
+                    .iter()
+                    .enumerate()
+                    .map(|(i, column)| column.map(|value| value.contains(scalar_str.value(i))));
+
+                Ok(Arc::new(BooleanArray::from_iter(result)) as ArrayRef)
+            },
+            vec![],
+        ));
+
+        // Register contains_tokens function, which uses fts index if any
+        let contains_udf = create_udf(
+            "contains_tokens",
+            vec![DataType::Utf8, DataType::Utf8],
+            DataType::Boolean,
+            Volatility::Immutable,
+            function,
+        );
+        ctx.register_udf(contains_udf);
     }
 }
 
@@ -134,10 +177,16 @@ impl SqlQuery {
 #[cfg(test)]
 mod tests {
     use crate::utils::test::{DatagenExt, FragmentCount, FragmentRowCount};
+    use crate::Dataset;
     use all_asserts::assert_true;
     use arrow_array::cast::AsArray;
     use arrow_array::types::{Int32Type, Int64Type, UInt64Type};
+    use arrow_array::{Array, RecordBatch, RecordBatchIterator, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
     use lance_datagen::{array, gen_batch};
+    use lance_index::scalar::ScalarIndexParams;
+    use lance_index::{DatasetIndexExt, IndexType};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn test_sql_execute() {
@@ -255,5 +304,89 @@ mod tests {
         let plan = builder.into_explain_plan(true, false).await.unwrap();
 
         assert!(plan.contains("Aggregate") || plan.contains("SUM"));
+    }
+
+    #[tokio::test]
+    async fn test_sql_contains_tokens() {
+        let text_col = Arc::new(StringArray::from(vec![
+            "a cat",
+            "lovely cat",
+            "white cat",
+            "catch up",
+            "fish",
+        ]));
+
+        // Prepare dataset
+        let batch = RecordBatch::try_new(
+            Schema::new(vec![Field::new("text", DataType::Utf8, false)]).into(),
+            vec![text_col.clone()],
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream = RecordBatchIterator::new(vec![batch].into_iter().map(Ok), schema);
+        let mut dataset = Dataset::write(stream, "memory://test/table", None)
+            .await
+            .unwrap();
+
+        // Test without fts index
+        let results = dataset
+            .sql("select * from foo where contains_tokens(text, 'cat')")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+
+        pretty_assertions::assert_eq!(
+            results
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["a cat", "lovely cat", "white cat", "catch up"])
+        );
+
+        // Test with fts index
+        dataset
+            .create_index(
+                &["text"],
+                IndexType::Inverted,
+                None,
+                &ScalarIndexParams::default(),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let results = dataset
+            .sql("select * from foo where contains_tokens(text, 'cat')")
+            .table_name("foo")
+            .build()
+            .await
+            .unwrap()
+            .into_batch_records()
+            .await
+            .unwrap();
+
+        pretty_assertions::assert_eq!(results.len(), 1);
+        let results = results.into_iter().next().unwrap();
+        pretty_assertions::assert_eq!(results.num_columns(), 1);
+
+        // TODO: fts index introduces false negatives, so "catch up" will miss. After implementing
+        //  fts index for contains_tokens, remove "catch up" from the expected values below.
+        pretty_assertions::assert_eq!(
+            results
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap(),
+            &StringArray::from(vec!["a cat", "lovely cat", "white cat", "catch up"])
+        );
     }
 }
