@@ -1113,7 +1113,7 @@ pub fn document_input(
     let field = schema.column_with_name(column).expect_ok()?.1;
     match field.data_type() {
         DataType::Utf8 | DataType::LargeUtf8 => Ok(input),
-        DataType::List(field)
+        DataType::List(field) | DataType::LargeList(field)
             if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) =>
         {
             Ok(Box::pin(FlattenStream::new(input)))
@@ -1128,7 +1128,12 @@ pub fn document_input(
             }),
         },
         _ => Err(Error::InvalidInput {
-            source: format!("column {} is not utf8 or list of utf8", column).into(),
+            source: format!(
+                "column {} has type {}, is not utf8, large utf8 type/list, or large binary",
+                column,
+                field.data_type()
+            )
+            .into(),
             location: location!(),
         }),
     }

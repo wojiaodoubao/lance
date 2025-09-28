@@ -112,8 +112,8 @@ impl ScalarIndexPlugin for InvertedIndexPlugin {
     ) -> Result<Box<dyn TrainingRequest>> {
         match field.data_type() {
             DataType::Utf8 | DataType::LargeUtf8 | DataType::LargeBinary => (),
-            DataType::List(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
-            DataType::LargeList(field) if matches!(field.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            DataType::List(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
+            DataType::LargeList(f) if matches!(f.data_type(), DataType::Utf8 | DataType::LargeUtf8) => (),
 
             _ => return Err(Error::InvalidInput {
                 source: format!(
