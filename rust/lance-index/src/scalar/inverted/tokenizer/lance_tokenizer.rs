@@ -288,7 +288,6 @@ mod tests {
         let mut tokenizer =
             tantivy::tokenizer::TextAnalyzer::builder(SimpleTokenizer::default()).build();
         let tokens = flatten_triplet(text, &mut tokenizer).unwrap();
-        println!("{:?}", tokens);
 
         assert_eq!(tokens.len(), 6);
         assert_token(&tokens[0], 0, "a,number,1");
