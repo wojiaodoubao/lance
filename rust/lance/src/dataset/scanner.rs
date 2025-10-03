@@ -11,7 +11,7 @@ use arrow_array::{Array, Float32Array, Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef, SortOptions};
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
-use datafusion::common::{exec_datafusion_err, DFSchema, NullEquality, SchemaExt};
+use datafusion::common::{exec_datafusion_err, DFSchema, JoinType, NullEquality, SchemaExt};
 use datafusion::functions_aggregate;
 use datafusion::functions_aggregate::count::count_udaf;
 use datafusion::logical_expr::{col, lit, Expr, ScalarUDF};
@@ -37,6 +37,8 @@ use datafusion_physical_expr::{aggregate::AggregateExprBuilder, expressions::Col
 use datafusion_physical_expr::{create_physical_expr, LexOrdering, Partitioning, PhysicalExpr};
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
+use datafusion_physical_plan::joins::PartitionMode;
+use datafusion_physical_plan::projection::ProjectionExec;
 use futures::future::BoxFuture;
 use futures::stream::{Stream, StreamExt};
 use futures::{FutureExt, TryStreamExt};
@@ -1800,11 +1802,57 @@ impl Scanner {
                     planned_read.plan
                 }
             }
-            _ => {
-                return Err(Error::InvalidInput {
-                    source: "Cannot have both nearest and full text search".into(),
-                    location: location!(),
-                })
+            (Some(vec_query), Some(fts_query)) => {
+                let use_index = if vec_query.use_index {
+                    let column_id = self.dataset.schema().field_id(vec_query.column.as_str())?;
+                    let indices = self.dataset.load_indices().await?;
+                    indices.iter().any(|i| i.fields.contains(&column_id))
+                } else {
+                    false
+                };
+
+                if use_index {
+                    // Join the result of full text search and vector search.
+                    let vector_plan = self.vector_search_source(&mut filter_plan).await?;
+                    let fts_plan = self.fts_search_source(&mut filter_plan, fts_query).await?;
+
+                    let vector_row_id = Column::new_with_schema(ROW_ID, vector_plan.schema().as_ref())?;
+                    let fts_row_id = Column::new_with_schema(ROW_ID, fts_plan.schema().as_ref())?;
+                    let join = HashJoinExec::try_new(
+                        vector_plan,
+                        fts_plan,
+                        vec![(Arc::new(vector_row_id), Arc::new(fts_row_id))],
+                        None,
+                        &JoinType::Inner,
+                        None,
+                        PartitionMode::CollectLeft,
+                        NullEquality::NullEqualsNull,
+                    )?;
+
+                    let schema = join.schema();
+                    let mut projection_exprs = Vec::new();
+                    let mut contain_rowid = false;
+                    for field in schema.fields() {
+                        if field.name() == ROW_ID {
+                            if contain_rowid {
+                                continue
+                            }
+                            contain_rowid = true;
+                        }
+                        projection_exprs.push((Arc::new(Column::new_with_schema(field.name(), schema.as_ref())?) as Arc<dyn PhysicalExpr>, field.name().clone()));
+                    }
+
+                    let projection_exec = ProjectionExec::try_new(projection_exprs, Arc::new(join))?;
+                    Arc::new(projection_exec)
+                } else {
+                    let fts_plan = self.fts_search_source(&mut filter_plan, fts_query).await?;
+
+                    let projection = self.dataset.empty_projection()
+                        .union_column(&vec_query.column, OnMissing::Error)?;
+                    let plan = self.take(fts_plan, projection)?;
+
+                    self.flat_knn(plan, vec_query)?
+                }
             }
         };
 
