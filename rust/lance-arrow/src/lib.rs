@@ -35,6 +35,7 @@ pub mod json;
 pub mod list;
 pub mod memory;
 pub mod r#struct;
+pub mod variant;
 
 /// Arrow extension metadata key for extension name
 pub const ARROW_EXT_NAME_KEY: &str = "ARROW:extension:name";

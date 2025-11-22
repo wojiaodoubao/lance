@@ -23,6 +23,10 @@ arrow-select = { workspace = true }
 bytes = { workspace = true }
 half = { workspace = true }
 jsonb ={ workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
 num-traits = { workspace = true }
 rand.workspace = true
 
