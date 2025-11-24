@@ -7,6 +7,7 @@ pub mod decimal;
 pub mod object;
 pub mod metadata;
 pub mod list;
+pub mod utils;
 
 use std::sync::LazyLock;
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Field, Fields as ArrowFields};
@@ -16,6 +17,7 @@ use crate::variant::decimal::{VariantDecimal16, VariantDecimal4, VariantDecimal8
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 pub use uuid::Uuid;
 use crate::variant::list::VariantList;
+use crate::variant::metadata::VariantMetadata;
 use crate::variant::object::VariantObject;
 
 /// Arrow extension type name for Variant data
@@ -142,6 +144,16 @@ pub enum Variant<'m, 'v> {
 
     /// Basic type: Object (basic_type_id=2).
     Object(VariantObject<'m, 'v>),
+}
+
+impl<'m, 'v> Variant<'m, 'v> {
+    pub fn new(metadata: &'m [u8], value: &'v [u8]) -> Self {
+        // let metadata = VariantMetadata::try_new_with_shallow_validation(metadata)
+        //     .expect("Invalid variant metadata");
+        // Self::try_new_with_metadata_and_shallow_validation(metadata, value)
+        //     .expect("Invalid variant data")
+        todo!()
+    }
 }
 
 /// create an arrow variant type field with specified name
