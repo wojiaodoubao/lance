@@ -27,6 +27,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+paste = "1"
 num-traits = { workspace = true }
 rand.workspace = true
 

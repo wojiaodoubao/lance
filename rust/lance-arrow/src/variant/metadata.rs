@@ -41,7 +41,7 @@ impl OffsetSizeBytes {
     ///   (`0` is the first value, `1` the next, …).
     ///
     /// Each value is `self as u32` bytes wide (1, 2, 3 or 4), zero-extended to 32 bits as needed.
-    pub(crate) fn unpack_at_offset(
+    pub(crate) fn unpack_u32_at_offset(
         &self,
         bytes: &[u8],
         byte_offset: usize,  // how many bytes to skip
@@ -155,6 +155,7 @@ pub struct VariantMetadata<'m> {
 }
 
 impl<'m> VariantMetadata<'m> {
+    // TODO: add unit tests
     pub(crate) fn try_new(bytes: &'m [u8]) -> Result<Self, ArrowError> {
         // Parse header
         let header_byte = bytes.first().ok_or(ArrowError::InvalidArgumentError("Variant metadata must have at least one byte".to_string()))?;
@@ -164,9 +165,8 @@ impl<'m> VariantMetadata<'m> {
         let dictionary_size =
             header
                 .offset_size
-                .unpack_at_offset(bytes, 1, 0)?;
+                .unpack_u32_at_offset(bytes, 1, 0)?;
 
-        // Calculate the starting offset of the dictionary string bytes.
         // first_value_byte = header size(1Byte) + offset_size + (dict_size + 1) * offset_size
         //
         // The max value of offset_size is u32, so the offsets in metadata should never exceed
