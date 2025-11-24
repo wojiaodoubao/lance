@@ -3,8 +3,9 @@
 
 use arrow_schema::ArrowError;
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::utils::{overflow_error, slice_from_slice};
+use crate::variant::utils::{overflow_error, slice_from_slice, try_binary_search_range_by};
 use crate::variant::value::{VariantObjectHeader, VariantValueHeader, VariantValueMeta};
+use crate::variant::Variant;
 
 #[derive(Debug, Clone)]
 pub struct VariantObject<'m, 'v> {
@@ -57,5 +58,56 @@ impl<'m, 'v> VariantObject<'m, 'v> {
             first_field_offset_byte,
             first_value_byte,
         })
+    }
+
+    /// Get a field's value by name.
+    pub fn try_field_with_name(&self, name: &str) -> Result<Variant<'m, 'v>, ArrowError> {
+        let cmp = |i| {
+            match self.try_field_name(i) {
+                Ok(f) => Some(f.cmp(name)),
+                Err(_) => None,
+            }
+        };
+
+        match try_binary_search_range_by(0..self.num_elements as usize, cmp) {
+            Some(Ok(index)) => Ok(self.try_field_with_index(index)?),
+            _ => Err(ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))),
+        }
+    }
+
+    /// Get a field's value by index.
+    pub fn try_field_with_index(&self, i: usize) -> Result<Variant<'m, 'v>, ArrowError> {
+        if i < self.num_elements as usize {
+            let value_bytes = slice_from_slice(self.value, self.first_value_byte as _..)?;
+            let value_bytes = slice_from_slice(value_bytes, self.get_offset(i)? as _..)?;
+            Variant::try_new(self.metadata.clone(), value_bytes)
+        } else {
+            Err(ArrowError::InvalidArgumentError(format!("Variant object index {} out of bounds", i)))
+        }
+    }
+
+    // Returns field name by index
+    fn try_field_name(&self, i: usize) -> Result<&'m str, ArrowError> {
+        let field_id_bytes = self.field_id_bytes()?;
+        let field_id = self.header.field_id_size.unpack_u32_at_offset(field_id_bytes, 0, i)?;
+        self.metadata.get_name(field_id as _)
+    }
+
+    // Attempts to retrieve the ith offset from the field offset region of the byte buffer.
+    fn get_offset(&self, i: usize) -> Result<u32, ArrowError> {
+        self.header.field_offset_size.unpack_u32_at_offset(self.field_offset_bytes()?, 0, i)
+    }
+
+    // Returns field id bytes.
+    fn field_id_bytes(&self) -> Result<&'v [u8], ArrowError> {
+        let field_id_start = 1 + self.num_elements as usize;
+        let byte_range = field_id_start..self.first_field_offset_byte as usize;
+        slice_from_slice(self.value, byte_range)
+    }
+
+    // Returns field offset bytes.
+    fn field_offset_bytes(&self) -> Result<&'v [u8], ArrowError> {
+        let byte_range = self.first_field_offset_byte as _..self.first_value_byte as _;
+        slice_from_slice(self.value, byte_range)
     }
 }
