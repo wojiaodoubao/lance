@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::{ArrowError, DataType, Field, Fields, IntervalUnit, Schema};
+use arrow_schema::ArrowError;
+use bytes::Bytes;
 use crate::variant::metadata::OffsetSizeBytes::{Four, One, Three, Two};
 use crate::variant::utils::{array_from_slice, overflow_error, slice_from_slice, string_from_slice};
 
@@ -43,7 +44,7 @@ impl OffsetSizeBytes {
     /// Each value is `self as u32` bytes wide (1, 2, 3 or 4), zero-extended to 32 bits as needed.
     pub(crate) fn unpack_u32_at_offset(
         &self,
-        bytes: &[u8],
+        bytes: &Bytes,
         byte_offset: usize,  // how many bytes to skip
         offset_index: usize, // which offset in an array of offsets
     ) -> Result<u32, ArrowError> {
@@ -146,17 +147,17 @@ impl VariantMetadataHeader {
 ///             +-----------------------+
 ///
 #[derive(Debug, Clone, PartialEq)]
-pub struct VariantMetadata<'m> {
+pub struct VariantMetadata {
     /// (Only) the bytes that make up this metadata instance.
-    pub(crate) bytes: &'m [u8],
+    pub(crate) bytes: Bytes,
     header: VariantMetadataHeader,
     dictionary_size: u32,
     first_value_byte: u32,
 }
 
-impl<'m> VariantMetadata<'m> {
+impl VariantMetadata {
     // TODO: add unit tests
-    pub(crate) fn try_new(bytes: &'m [u8]) -> Result<Self, ArrowError> {
+    pub(crate) fn try_new(bytes: Bytes) -> Result<Self, ArrowError> {
         // Parse header
         let header_byte = bytes.first().ok_or(ArrowError::InvalidArgumentError("Variant metadata must have at least one byte".to_string()))?;
         let header = VariantMetadataHeader::try_new(header_byte)?;
@@ -165,7 +166,7 @@ impl<'m> VariantMetadata<'m> {
         let dictionary_size =
             header
                 .offset_size
-                .unpack_u32_at_offset(bytes, 1, 0)?;
+                .unpack_u32_at_offset(&bytes, 1, 0)?;
 
         // first_value_byte = header size(1Byte) + offset_size + (dict_size + 1) * offset_size
         //
@@ -187,16 +188,16 @@ impl<'m> VariantMetadata<'m> {
 
     /// Attempts to retrieve a dictionary entry by index, failing if out of bounds or if the
     /// underlying bytes are [invalid].
-    pub fn get_name(&self, i: usize) -> Result<&'m str, ArrowError> {
+    pub fn get_name(&self, i: usize) -> Result<&str, ArrowError> {
         let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
-        string_from_slice(self.bytes, self.first_value_byte as _, byte_range)
+        string_from_slice(&self.bytes, self.first_value_byte as _, byte_range)
     }
 
     /// Gets offset of the dictionary entry by index.
     fn get_offset(&self, i: usize) -> Result<u32, ArrowError> {
         let offset_byte_start = 1 + self.header.offset_size as usize;
         let offset_byte_range = offset_byte_start..self.first_value_byte as usize;
-        let bytes = slice_from_slice(self.bytes, offset_byte_range)?;
-        self.header.offset_size.unpack_u32_at_offset(bytes, 0, i)
+        let bytes = slice_from_slice(&self.bytes, offset_byte_range)?;
+        self.header.offset_size.unpack_u32_at_offset(&bytes, 0, i)
     }
 }

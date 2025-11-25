@@ -25,7 +25,7 @@ use std::fmt;
 /// assert_eq!(extract_scale(dec4), 2);
 /// assert_eq!(extract_scale(dec8), 3);
 /// ```
-pub trait VariantDecimalType: Into<super::Variant<'static, 'static>> {
+pub trait VariantDecimalType: Into<super::Variant> {
     /// The underlying signed integer type (i32, i64, or i128)
     type Native;
 

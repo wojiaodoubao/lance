@@ -2,23 +2,41 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::ArrowError;
+use bytes::Bytes;
 use crate::variant::metadata::VariantMetadata;
 use crate::variant::utils::{overflow_error, slice_from_slice, try_binary_search_range_by};
 use crate::variant::value::{VariantObjectHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::Variant;
+use crate::variant::{AbstractVariantObject, Variant};
 
 #[derive(Debug, Clone)]
-pub struct VariantObject<'m, 'v> {
-    pub metadata: VariantMetadata<'m>,
-    pub value: &'v [u8],
+pub struct VariantObject {
+    pub metadata: VariantMetadata,
+    pub value: Bytes,
     header: VariantObjectHeader,
     num_elements: u32,
     first_field_offset_byte: u32,
     first_value_byte: u32,
 }
 
-impl<'m, 'v> VariantObject<'m, 'v> {
-    pub fn try_new(metadata: VariantMetadata<'m>, header: Option<VariantObjectHeader>, value: &'v [u8]) -> Result<Self, ArrowError> {
+impl AbstractVariantObject for VariantObject {
+    /// Get a field's value by name.
+    fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
+        let cmp = |i| {
+            match self.try_field_name(i) {
+                Ok(f) => Some(f.cmp(name)),
+                Err(_) => None,
+            }
+        };
+
+        match try_binary_search_range_by(0..self.num_elements as usize, cmp) {
+            Some(Ok(index)) => Ok(self.try_field_with_index(index)?),
+            _ => Err(ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))),
+        }
+    }
+}
+
+impl VariantObject {
+    pub fn try_new(metadata: VariantMetadata, header: Option<VariantObjectHeader>, value: Bytes) -> Result<Self, ArrowError> {
         let header = match header {
             Some(h) => h,
             None => {
@@ -35,7 +53,7 @@ impl<'m, 'v> VariantObject<'m, 'v> {
         let num_elements =
             header
                 .num_elements_size
-                .unpack_u32_at_offset(value, 1, 0)?;
+                .unpack_u32_at_offset(&value, 1, 0)?;
 
         // first_field_offset_byte = 1 + num_elements_size + field_id_size * num_elements
         let first_field_offset_byte = num_elements
@@ -60,26 +78,11 @@ impl<'m, 'v> VariantObject<'m, 'v> {
         })
     }
 
-    /// Get a field's value by name.
-    pub fn try_field_with_name(&self, name: &str) -> Result<Variant<'m, 'v>, ArrowError> {
-        let cmp = |i| {
-            match self.try_field_name(i) {
-                Ok(f) => Some(f.cmp(name)),
-                Err(_) => None,
-            }
-        };
-
-        match try_binary_search_range_by(0..self.num_elements as usize, cmp) {
-            Some(Ok(index)) => Ok(self.try_field_with_index(index)?),
-            _ => Err(ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))),
-        }
-    }
-
     /// Get a field's value by index.
-    pub fn try_field_with_index(&self, i: usize) -> Result<Variant<'m, 'v>, ArrowError> {
+    fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
         if i < self.num_elements as usize {
-            let value_bytes = slice_from_slice(self.value, self.first_value_byte as _..)?;
-            let value_bytes = slice_from_slice(value_bytes, self.get_offset(i)? as _..)?;
+            let value_bytes = slice_from_slice(&self.value, self.first_value_byte as _..self.value.len())?;
+            let value_bytes = slice_from_slice(&value_bytes, self.get_offset(i)? as _..value_bytes.len())?;
             Variant::try_new(self.metadata.clone(), value_bytes)
         } else {
             Err(ArrowError::InvalidArgumentError(format!("Variant object index {} out of bounds", i)))
@@ -87,27 +90,27 @@ impl<'m, 'v> VariantObject<'m, 'v> {
     }
 
     // Returns field name by index
-    fn try_field_name(&self, i: usize) -> Result<&'m str, ArrowError> {
+    fn try_field_name(&self, i: usize) -> Result<&str, ArrowError> {
         let field_id_bytes = self.field_id_bytes()?;
-        let field_id = self.header.field_id_size.unpack_u32_at_offset(field_id_bytes, 0, i)?;
+        let field_id = self.header.field_id_size.unpack_u32_at_offset(&field_id_bytes, 0, i)?;
         self.metadata.get_name(field_id as _)
     }
 
     // Attempts to retrieve the ith offset from the field offset region of the byte buffer.
     fn get_offset(&self, i: usize) -> Result<u32, ArrowError> {
-        self.header.field_offset_size.unpack_u32_at_offset(self.field_offset_bytes()?, 0, i)
+        self.header.field_offset_size.unpack_u32_at_offset(&self.field_offset_bytes()?, 0, i)
     }
 
     // Returns field id bytes.
-    fn field_id_bytes(&self) -> Result<&'v [u8], ArrowError> {
+    fn field_id_bytes(&self) -> Result<Bytes, ArrowError> {
         let field_id_start = 1 + self.num_elements as usize;
         let byte_range = field_id_start..self.first_field_offset_byte as usize;
-        slice_from_slice(self.value, byte_range)
+        slice_from_slice(&self.value, byte_range)
     }
 
     // Returns field offset bytes.
-    fn field_offset_bytes(&self) -> Result<&'v [u8], ArrowError> {
+    fn field_offset_bytes(&self) -> Result<Bytes, ArrowError> {
         let byte_range = self.first_field_offset_byte as _..self.first_value_byte as _;
-        slice_from_slice(self.value, byte_range)
+        slice_from_slice(&self.value, byte_range)
     }
 }
