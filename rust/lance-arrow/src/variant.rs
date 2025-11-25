@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::variant::decimal::{VariantDecimal16, VariantDecimal4, VariantDecimal8};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 pub use uuid::Uuid;
-use crate::variant::list::VariantArray;
+use crate::variant::list::VariantList;
 use crate::variant::metadata::VariantMetadata;
 use crate::variant::object::VariantObject;
 use crate::variant::utils::{decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double, decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_long_string, decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros, decode_timestampntz_nanos, decode_uuid, slice_from_slice};
@@ -142,8 +142,8 @@ pub enum Variant<'m, 'v> {
     /// Primitive type(type_id=20): TIMESTAMP(isAdjustedToUTC=false, NANOS)
     TimestampNtzNanos(NaiveDateTime),
 
-    /// Basic type: Array (basic_type_id=1).
-    List(VariantArray<'m, 'v>),
+    /// Basic type: List (basic_type_id=1).
+    List(VariantList<'m, 'v>),
 
     /// Basic type: Object (basic_type_id=2).
     Object(VariantObject<'m, 'v>),
@@ -218,9 +218,9 @@ impl<'m, 'v> Variant<'m, 'v> {
                 let object = VariantObject::try_new(metadata, Some(header), value_data)?;
                 Ok(Variant::Object(object))
             },
-            VariantValueHeader::Array(header) => {
-                let array = VariantArray::try_new(metadata, Some(header), value_data)?;
-                Ok(Variant::List(array))
+            VariantValueHeader::List(header) => {
+                let list = VariantList::try_new(metadata, Some(header), value_data)?;
+                Ok(Variant::List(list))
             }
         }
     }

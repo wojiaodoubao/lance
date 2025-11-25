@@ -4,27 +4,27 @@
 use arrow_schema::ArrowError;
 use crate::variant::metadata::VariantMetadata;
 use crate::variant::utils::{overflow_error, slice_from_slice};
-use crate::variant::value::{VariantArrayHeader, VariantValueHeader, VariantValueMeta};
+use crate::variant::value::{VariantListHeader, VariantValueHeader, VariantValueMeta};
 use crate::variant::Variant;
 
 #[derive(Debug, Clone)]
-pub struct VariantArray<'m, 'v> {
+pub struct VariantList<'m, 'v> {
     pub metadata: VariantMetadata<'m>,
     pub value: &'v [u8],
-    header: VariantArrayHeader,
+    header: VariantListHeader,
     num_elements: u32,
     first_value_byte: u32,
 }
 
-impl<'m, 'v> VariantArray<'m, 'v> {
-    pub fn try_new(metadata: VariantMetadata<'m>, header: Option<VariantArrayHeader>, value: &'v [u8]) -> Result<Self, ArrowError> {
+impl<'m, 'v> VariantList<'m, 'v> {
+    pub fn try_new(metadata: VariantMetadata<'m>, header: Option<VariantListHeader>, value: &'v [u8]) -> Result<Self, ArrowError> {
         let header = match header {
             Some(header) => header,
             None => {
                 let first_byte = value.first().ok_or(ArrowError::InvalidArgumentError("Variant value must have at least one byte".to_string()))?;
                 let value_meta = VariantValueMeta::try_from(first_byte)?;
                 match value_meta.header {
-                    VariantValueHeader::Array(header) => header,
+                    VariantValueHeader::List(header) => header,
                     _ => return Err(ArrowError::InvalidArgumentError(format!("Variant value must be an object, but got {:?}", value_meta.header))),
                 }
             }
@@ -54,19 +54,23 @@ impl<'m, 'v> VariantArray<'m, 'v> {
 
     /// Get a field's value by index.
     pub fn try_field_with_index(&self, i: usize) -> Result<Variant<'m, 'v>, ArrowError> {
-        let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
+        if i < self.num_elements as usize {
+            let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
 
-        let start_byte = self.first_value_byte
-            .checked_add(byte_range.start)
-            .ok_or_else(|| overflow_error("slice start"))? as usize;
-        // TODO: 不需要end_byte，直接截到尾巴就可以。
-        // let end_byte = self.first_value_byte
-        //     .checked_add(byte_range.end)
-        //     .ok_or_else(|| overflow_error("slice end"))? as usize;
+            let start_byte = self.first_value_byte
+                .checked_add(byte_range.start)
+                .ok_or_else(|| overflow_error("slice start"))? as usize;
+            // TODO: 不需要end_byte，直接截到尾巴就可以。
+            // let end_byte = self.first_value_byte
+            //     .checked_add(byte_range.end)
+            //     .ok_or_else(|| overflow_error("slice end"))? as usize;
 
-        let value_bytes =
-            slice_from_slice(self.value, start_byte..)?;
-        Variant::try_new(self.metadata.clone(), value_bytes)
+            let value_bytes =
+                slice_from_slice(self.value, start_byte..)?;
+            Variant::try_new(self.metadata.clone(), value_bytes)
+        } else {
+            Err(ArrowError::InvalidArgumentError(format!("Variant list index {} out of bounds", i)))
+        }
     }
 
     fn get_offset(&self, index: usize) -> Result<u32, ArrowError> {

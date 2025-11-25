@@ -6,12 +6,12 @@ use crate::variant::metadata::OffsetSizeBytes;
 use crate::variant::object::VariantObject;
 
 /// The basic type of [`Variant`] value. This is encoded in 2 bits, including: primitive, object
-/// and array.
+/// and list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VariantBasicType {
     Primitive = 0,
     Object = 1,
-    Array = 2,
+    List = 2,
 }
 
 impl TryFrom<u8> for VariantBasicType {
@@ -21,7 +21,7 @@ impl TryFrom<u8> for VariantBasicType {
         match value {
             0 => Ok(Self::Primitive),
             1 => Ok(Self::Object),
-            2 => Ok(Self::Array),
+            2 => Ok(Self::List),
             n => Err(ArrowError::InvalidArgumentError(
                 format!("Unsupported variant basic type: {n}"),
             )),
@@ -115,14 +115,14 @@ impl TryFrom<u8> for VariantObjectHeader {
     }
 }
 
-/// A parsed version of the variant array value header byte.
+/// A parsed version of the variant list value header byte.
 #[derive(Debug, Clone, PartialEq)]
-pub struct VariantArrayHeader {
+pub struct VariantListHeader {
     pub(crate) field_offset_size: OffsetSizeBytes,
     pub(crate) num_elements_size: OffsetSizeBytes, // either 1 or 4 bytes
 }
 
-impl TryFrom<u8> for VariantArrayHeader {
+impl TryFrom<u8> for VariantListHeader {
     type Error = ArrowError;
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
@@ -145,7 +145,7 @@ impl TryFrom<u8> for VariantArrayHeader {
 pub enum VariantValueHeader {
     Primitive(VariantPrimitiveType),
     Object(VariantObjectHeader),
-    Array(VariantArrayHeader),
+    List(VariantListHeader),
 }
 
 pub struct VariantValueMeta<'m> {
@@ -167,7 +167,7 @@ impl <'m> TryFrom<&'m u8> for VariantValueMeta<'m> {
                 VariantValueHeader::Primitive(primitive_type)
             },
             VariantBasicType::Object => VariantValueHeader::Object(VariantObjectHeader::try_from(header_value)?),
-            VariantBasicType::Array => VariantValueHeader::Array(VariantArrayHeader::try_from(header_value)?),
+            VariantBasicType::List => VariantValueHeader::List(VariantListHeader::try_from(header_value)?),
         };
         Ok(Self {
             raw_byte: value,
