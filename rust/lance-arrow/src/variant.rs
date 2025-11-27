@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-//! Lance Variant support for Apache Arrow.
+//! Lance Variant support.
 
 pub mod decimal;
 pub mod object;
@@ -9,8 +9,7 @@ pub mod metadata;
 pub mod list;
 pub mod utils;
 mod value;
-mod shredding_object;
-mod shredding_list;
+mod variant_array;
 
 use std::sync::LazyLock;
 use arrow_array::{Array, ArrayRef, GenericBinaryArray, LargeStringArray, StringArray};
@@ -23,11 +22,11 @@ use serde::{Deserialize, Serialize};
 use crate::variant::decimal::{VariantDecimal16, VariantDecimal4, VariantDecimal8};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 pub use uuid::Uuid;
-use crate::variant::list::VariantList;
+use crate::variant::list::EncodedList;
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::object::VariantObject;
-use crate::variant::shredding_list::ShreddingList;
-use crate::variant::shredding_object::ShreddingObject;
+use crate::variant::object::EncodedObject;
+use crate::variant::list::TypedList;
+use crate::variant::object::TypedObject;
 use crate::variant::utils::{decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double, decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_string, decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros, decode_timestampntz_nanos, decode_uuid, slice_from_slice, ListArrayExt};
 use crate::variant::value::{VariantPrimitiveType, VariantValueHeader, VariantValueMeta};
 
@@ -151,96 +150,28 @@ pub enum Variant {
     TimestampNtzNanos(NaiveDateTime),
 
     /// Basic type: List (basic_type_id=1).
-    List(Box<dyn AbstractVariantList>),
+    List(Box<dyn VariantList>),
 
     /// Basic type: Object (basic_type_id=2).
-    Object(Box<dyn AbstractVariantObject>),
+    Object(Box<dyn VariantObject>),
 }
 
-pub enum VariantBinary {
-    Bytes(Bytes),
-    Binary(GenericBinaryArray<i32>),
-    LargeBinary(GenericBinaryArray<i64>),
-}
-
-impl From<Bytes> for VariantBinary {
-    fn from(bytes: Bytes) -> Self {
-        Self::Bytes(bytes)
-    }
-}
-
-impl From<GenericBinaryArray<i32>> for VariantBinary {
-    fn from(arr: GenericBinaryArray<i32>) -> Self {
-        Self::Binary(arr)
-    }
-}
-
-impl From<GenericBinaryArray<i64>> for VariantBinary {
-    fn from(arr: GenericBinaryArray<i64>) -> Self {
-        Self::LargeBinary(arr)
-    }
-}
-
-impl AsRef<[u8]> for VariantBinary {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Bytes(bytes) => bytes,
-            Self::Binary(arr) => arr.value(0),
-            Self::LargeBinary(arr) => arr.value(0),
-        }
-    }
-}
-
-pub enum VariantString {
-    Bytes(Bytes),
-    String(StringArray),
-    LargeString(LargeStringArray),
-}
-
-impl From<Bytes> for VariantString {
-    fn from(value: Bytes) -> Self {
-        Self::Bytes(value)
-    }
-}
-
-impl From<StringArray> for VariantString {
-    fn from(arr: StringArray) -> Self {
-        Self::String(arr)
-    }
-}
-
-impl From<LargeStringArray> for VariantString {
-    fn from(arr: LargeStringArray) -> Self {
-        Self::LargeString(arr)
-    }
-}
-
-impl AsRef<str> for VariantString {
-    fn as_ref(&self) -> &str {
-        match self {
-            Self::Bytes(bytes) => str::from_utf8(bytes).unwrap(),
-            Self::String(arr) => arr.value(0),
-            Self::LargeString(arr) => arr.value(0),
-        }
-    }
-}
-
-pub trait AbstractVariantObject {
+pub trait VariantObject {
     fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError>;
 }
 
-pub trait AbstractVariantList {
+pub trait VariantList {
     fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError>;
 }
 
 impl Variant {
-    pub fn new(metadata: Bytes, value: Bytes) -> Self {
+    pub fn new_encoded(metadata: Bytes, value: Bytes) -> Self {
         let metadata = VariantMetadata::try_new(metadata)
             .expect("Invalid variant metadata");
-        Self::try_new(metadata, value).expect("Invalid variant data")
+        Self::try_new_encoded(metadata, value).expect("Invalid variant data")
     }
 
-    fn try_new(
+    fn try_new_encoded(
         metadata: VariantMetadata,
         value: Bytes,
     ) -> Result<Self, ArrowError> {
@@ -299,11 +230,11 @@ impl Variant {
                 Ok(variant)
             },
             VariantValueHeader::Object(header) => {
-                let object = VariantObject::try_new(metadata, Some(header), value_data)?;
+                let object = EncodedObject::try_new(metadata, Some(header), value_data)?;
                 Ok(Self::Object(Box::new(object)))
             },
             VariantValueHeader::List(header) => {
-                let list = VariantList::try_new(metadata, Some(header), &value_data)?;
+                let list = EncodedList::try_new(metadata, Some(header), &value_data)?;
                 Ok(Self::List(Box::new(list)))
             }
         }
@@ -311,7 +242,7 @@ impl Variant {
 
     /// Create a variant from a shredding array. The shredding array must have exactly one element
     /// and the element must be a struct with exactly one field named "root".
-    fn new_shredding(value: &ArrayRef) -> Result<Self, ArrowError> {
+    pub fn new_typed(value: &ArrayRef) -> Result<Self, ArrowError> {
         if value.len() != 1 {
             return Err(ArrowError::InvalidArgumentError("Variant value must have exactly one element".to_string()));
         }
@@ -322,13 +253,13 @@ impl Variant {
                 let struct_array = value.as_struct();
                 let root_field = struct_array.column_by_name("root")
                     .ok_or_else(|| ArrowError::InvalidArgumentError("root field not found".to_string()))?;
-                Self::try_new_shredding(root_field)
+                Self::try_new_typed(root_field)
             },
             _ => Err(ArrowError::InvalidArgumentError("The root variant type must be a struct with exactly one root field".to_string()))
         }
     }
 
-    fn try_new_shredding(value: &ArrayRef) -> Result<Self, ArrowError> {
+    fn try_new_typed(value: &ArrayRef) -> Result<Self, ArrowError> {
         if (matches!(value.data_type(), DataType::List(_)) && as_list_array(value).num_items() != 1) || value.len() != 1 {
             return Err(ArrowError::InvalidArgumentError("Variant value must have exactly one element".to_string()));
         }
@@ -337,11 +268,11 @@ impl Variant {
         match data_type {
             // object
             DataType::Struct(_) => {
-                Ok(Self::Object(Box::new(ShreddingObject::try_new(value)?)))
+                Ok(Self::Object(Box::new(TypedObject::try_new(value)?)))
             },
             // list
             DataType::List(_) => {
-                Ok(Self::List(Box::new(ShreddingList::try_new(value)?)))
+                Ok(Self::List(Box::new(TypedList::try_new(value)?)))
             },
             // primitive
             DataType::Null => Ok(Self::Null),
@@ -421,6 +352,74 @@ impl Variant {
                 Ok(Self::from(DateTime::from_timestamp_nanos(value).naive_utc()))
             }
             _ => Err(ArrowError::InvalidArgumentError(format!("Invalid datatype: {:?}", data_type))),
+        }
+    }
+}
+
+pub enum VariantBinary {
+    Bytes(Bytes),
+    Binary(GenericBinaryArray<i32>),
+    LargeBinary(GenericBinaryArray<i64>),
+}
+
+impl From<Bytes> for VariantBinary {
+    fn from(bytes: Bytes) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl From<GenericBinaryArray<i32>> for VariantBinary {
+    fn from(arr: GenericBinaryArray<i32>) -> Self {
+        Self::Binary(arr)
+    }
+}
+
+impl From<GenericBinaryArray<i64>> for VariantBinary {
+    fn from(arr: GenericBinaryArray<i64>) -> Self {
+        Self::LargeBinary(arr)
+    }
+}
+
+impl AsRef<[u8]> for VariantBinary {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Binary(arr) => arr.value(0),
+            Self::LargeBinary(arr) => arr.value(0),
+        }
+    }
+}
+
+pub enum VariantString {
+    Bytes(Bytes),
+    String(StringArray),
+    LargeString(LargeStringArray),
+}
+
+impl From<Bytes> for VariantString {
+    fn from(value: Bytes) -> Self {
+        Self::Bytes(value)
+    }
+}
+
+impl From<StringArray> for VariantString {
+    fn from(arr: StringArray) -> Self {
+        Self::String(arr)
+    }
+}
+
+impl From<LargeStringArray> for VariantString {
+    fn from(arr: LargeStringArray) -> Self {
+        Self::LargeString(arr)
+    }
+}
+
+impl AsRef<str> for VariantString {
+    fn as_ref(&self) -> &str {
+        match self {
+            Self::Bytes(bytes) => str::from_utf8(bytes).unwrap(),
+            Self::String(arr) => arr.value(0),
+            Self::LargeString(arr) => arr.value(0),
         }
     }
 }

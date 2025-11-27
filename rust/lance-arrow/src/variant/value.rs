@@ -3,7 +3,7 @@
 
 use arrow_schema::ArrowError;
 use crate::variant::metadata::OffsetSizeBytes;
-use crate::variant::object::VariantObject;
+use crate::variant::object::EncodedObject;
 
 /// The basic type of [`Variant`] value. This is encoded in 2 bits, including: primitive, object
 /// and list.
@@ -87,7 +87,7 @@ impl TryFrom<u8> for VariantPrimitiveType {
     }
 }
 
-/// Header structure for [`VariantObject`]
+/// Header structure for [`EncodedObject`]
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantObjectHeader {
     pub(crate) field_offset_size: OffsetSizeBytes,

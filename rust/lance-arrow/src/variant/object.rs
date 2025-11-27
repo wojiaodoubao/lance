@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use arrow_array::{ArrayRef, StructArray};
+use arrow_array::cast::AsArray;
 use arrow_schema::ArrowError;
 use bytes::Bytes;
+use crate::DataTypeExt;
 use crate::variant::metadata::VariantMetadata;
 use crate::variant::utils::{overflow_error, slice_from_slice, try_binary_search_range_by};
 use crate::variant::value::{VariantObjectHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::{AbstractVariantObject, Variant};
+use crate::variant::{VariantObject, Variant};
 
 #[derive(Debug, Clone)]
-pub struct VariantObject {
+pub struct EncodedObject {
     pub metadata: VariantMetadata,
     pub value: Bytes,
     header: VariantObjectHeader,
@@ -18,7 +21,7 @@ pub struct VariantObject {
     first_value_byte: u32,
 }
 
-impl AbstractVariantObject for VariantObject {
+impl VariantObject for EncodedObject {
     /// Get a field's value by name.
     fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
         let cmp = |i| {
@@ -35,7 +38,7 @@ impl AbstractVariantObject for VariantObject {
     }
 }
 
-impl VariantObject {
+impl EncodedObject {
     pub fn try_new(metadata: VariantMetadata, header: Option<VariantObjectHeader>, value: Bytes) -> Result<Self, ArrowError> {
         let header = match header {
             Some(h) => h,
@@ -83,7 +86,7 @@ impl VariantObject {
         if i < self.num_elements as usize {
             let value_bytes = slice_from_slice(&self.value, self.first_value_byte as _..self.value.len())?;
             let value_bytes = slice_from_slice(&value_bytes, self.get_offset(i)? as _..value_bytes.len())?;
-            Variant::try_new(self.metadata.clone(), value_bytes)
+            Variant::try_new_encoded(self.metadata.clone(), value_bytes)
         } else {
             Err(ArrowError::InvalidArgumentError(format!("Variant object index {} out of bounds", i)))
         }
@@ -112,5 +115,31 @@ impl VariantObject {
     fn field_offset_bytes(&self) -> Result<Bytes, ArrowError> {
         let byte_range = self.first_field_offset_byte as _..self.first_value_byte as _;
         slice_from_slice(&self.value, byte_range)
+    }
+}
+
+pub struct TypedObject {
+    pub value: StructArray,
+}
+
+impl TypedObject {
+    pub fn try_new(value: &ArrayRef) -> Result<Self, ArrowError> {
+        if !value.data_type().is_struct() || value.len() != 1 {
+            return Err(ArrowError::InvalidArgumentError(
+                "ShreddingObject must be a struct array with only one row".to_string(),
+            ));
+        }
+
+        let value = value.as_struct();
+        Ok(Self { value: value.clone() })
+    }
+}
+
+impl VariantObject for TypedObject {
+    fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
+        let arr = self.value.column_by_name(name).ok_or_else(|| {
+            ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))
+        })?;
+        Variant::try_new_typed(arr)
     }
 }

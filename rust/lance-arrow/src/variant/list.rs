@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::ArrowError;
+use arrow_array::{ArrayRef, ListArray};
+use arrow_array::cast::as_list_array;
+use arrow_schema::{ArrowError, DataType};
 use bytes::Bytes;
+use num_traits::ToPrimitive;
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::utils::{overflow_error, slice_from_slice};
+use crate::variant::utils::{overflow_error, slice_from_slice, ListArrayExt};
 use crate::variant::value::{VariantListHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::{AbstractVariantList, Variant};
+use crate::variant::{VariantList, Variant};
 
 #[derive(Debug, Clone)]
-pub struct VariantList {
+pub struct EncodedList {
     pub metadata: VariantMetadata,
     pub value: Bytes,
     header: VariantListHeader,
@@ -17,7 +20,7 @@ pub struct VariantList {
     first_value_byte: u32,
 }
 
-impl AbstractVariantList for VariantList {
+impl VariantList for EncodedList {
     /// Get a field's value by index.
     fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
         if i < self.num_elements as usize {
@@ -33,14 +36,14 @@ impl AbstractVariantList for VariantList {
 
             let value_bytes =
                 slice_from_slice(&self.value, start_byte..self.value.len())?;
-            Variant::try_new(self.metadata.clone(), value_bytes)
+            Variant::try_new_encoded(self.metadata.clone(), value_bytes)
         } else {
             Err(ArrowError::InvalidArgumentError(format!("Variant list index {} out of bounds", i)))
         }
     }
 }
 
-impl VariantList {
+impl EncodedList {
     pub fn try_new(metadata: VariantMetadata, header: Option<VariantListHeader>, value: &Bytes) -> Result<Self, ArrowError> {
         let header = match header {
             Some(header) => header,
@@ -81,5 +84,52 @@ impl VariantList {
         let byte_range = first_offset_byte..self.first_value_byte as _;
         let offset_bytes = slice_from_slice(&self.value, byte_range)?;
         self.header.field_offset_size.unpack_u32_at_offset(&offset_bytes, 0, index)
+    }
+}
+
+pub struct TypedList {
+    pub value: ListArray,
+}
+
+impl TypedList {
+    pub fn try_new(value: &ArrayRef) -> Result<Self, ArrowError> {
+        if !matches!(value.data_type(), &DataType::List(_)) {
+            return Err(ArrowError::InvalidArgumentError(
+                "ShreddingList must be a list array".to_string(),
+            ));
+        }
+
+        let value = as_list_array(value);
+        if value.num_items() != 1 {
+            return Err(ArrowError::InvalidArgumentError(
+                "ShreddingList must be a list array with only one element".to_string(),
+            ));
+        }
+
+        Ok(Self { value: value.clone() })
+    }
+}
+
+impl VariantList for TypedList {
+    fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
+        let start = self.value
+            .offsets()
+            .get(i)
+            .map(|v| v.to_usize().unwrap())
+            .ok_or(ArrowError::InvalidArgumentError(format!(
+                "ShreddingList index {} is out of bounds",
+                i
+            )))?;
+        let end = self.value
+            .offsets()
+            .get(i + 1)
+            .map(|v| v.to_usize().unwrap())
+            .ok_or(ArrowError::InvalidArgumentError(format!(
+                "ShreddingList index {} is out of bounds",
+                i + 1
+            )))?;
+        let element_arr = self.value.values().slice(start, end - start);
+
+        Variant::try_new_typed(&element_arr)
     }
 }
