@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
 use arrow_array::{ArrayRef, ListArray};
 use arrow_array::cast::as_list_array;
 use arrow_schema::{ArrowError, DataType};
-use bytes::Bytes;
 use num_traits::ToPrimitive;
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::utils::{overflow_error, slice_from_slice, ListArrayExt};
+use crate::variant::utils::{first_byte_from_slice, overflow_error, slice_from_slice, ListArrayExt};
 use crate::variant::value::{VariantListHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::Variant;
+use crate::variant::{Buffer, Variant};
 
 #[derive(Debug, Clone)]
 pub enum VariantList {
@@ -28,19 +28,19 @@ impl VariantList {
 
 #[derive(Debug, Clone)]
 pub struct EncodedList {
-    pub metadata: VariantMetadata,
-    pub value: Bytes,
+    pub metadata: Arc<VariantMetadata>,
+    pub value: Buffer,
     header: VariantListHeader,
     num_elements: u32,
     first_value_byte: u32,
 }
 
 impl EncodedList {
-    pub fn try_new(metadata: VariantMetadata, header: Option<VariantListHeader>, value: &Bytes) -> Result<Self, ArrowError> {
+    pub fn try_new(metadata: Arc<VariantMetadata>, header: Option<VariantListHeader>, value: &Buffer) -> Result<Self, ArrowError> {
         let header = match header {
             Some(header) => header,
             None => {
-                let first_byte = value.first().ok_or(ArrowError::InvalidArgumentError("Variant value must have at least one byte".to_string()))?;
+                let first_byte = first_byte_from_slice(value.as_ref())?;
                 let value_meta = VariantValueMeta::try_from(first_byte)?;
                 match value_meta.header {
                     VariantValueHeader::List(header) => header,

@@ -12,8 +12,9 @@ use std::slice::SliceIndex;
 use arrow_array::{ArrayRef, ListArray};
 use bytes::Bytes;
 use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
-use num_traits::ToPrimitive;
+use num_traits::{AsPrimitive, ToPrimitive};
 use uuid::Uuid;
+use crate::variant::Buffer;
 
 /// Helper for reporting integer overflow errors in a consistent way.
 pub(crate) fn overflow_error(msg: &str) -> ArrowError {
@@ -22,9 +23,9 @@ pub(crate) fn overflow_error(msg: &str) -> ArrowError {
 
 #[inline]
 pub(crate) fn slice_from_slice(
-    bytes: &Bytes,
+    bytes: &Buffer,
     index: Range<usize>,
-) -> Result<Bytes, ArrowError> {
+) -> Result<Buffer, ArrowError> {
     if index.end > bytes.len() || index.start > bytes.len() {
         Err(ArrowError::InvalidArgumentError(format!(
             "Tried to extract byte(s) {index:?} from {}-byte buffer",
@@ -41,10 +42,10 @@ pub(crate) fn slice_from_slice(
 /// but using checked addition to prevent integer overflow panics on 32-bit systems.
 #[inline]
 pub(crate) fn slice_from_slice_at_offset(
-    bytes: &Bytes,
+    bytes: &Buffer,
     base_offset: usize,
     range: Range<usize>,
-) -> Result<Bytes, ArrowError> {
+) -> Result<Buffer, ArrowError> {
     let start_byte = base_offset
         .checked_add(range.start)
         .ok_or_else(|| overflow_error("slice start"))?;
@@ -55,10 +56,11 @@ pub(crate) fn slice_from_slice_at_offset(
 }
 
 pub(crate) fn array_from_slice<const N: usize>(
-    bytes: &Bytes,
+    bytes: &Buffer,
     offset: usize,
 ) -> Result<[u8; N], ArrowError> {
-    let bytes: &[u8] = &slice_from_slice_at_offset(bytes, offset, 0..N)?;
+    let buffer = slice_from_slice_at_offset(bytes, offset, 0..N)?;
+    let bytes: &[u8] = buffer.as_ref();
     bytes.try_into()
         .map_err(|e: TryFromSliceError| ArrowError::InvalidArgumentError(e.to_string()))
 }
@@ -73,7 +75,7 @@ pub(crate) fn first_byte_from_slice(slice: &[u8]) -> Result<u8, ArrowError> {
 /// Helper to get a &str from a slice at the given offset and range, or an error if it contains invalid UTF-8 data.
 #[inline]
 pub(crate) fn string_from_slice(
-    slice: &Bytes,
+    slice: &[u8],
     offset: usize,
     range: Range<usize>,
 ) -> Result<&str, ArrowError> {
@@ -84,7 +86,14 @@ pub(crate) fn string_from_slice(
         .checked_add(range.end)
         .ok_or_else(|| overflow_error("slice end"))?;
 
-    str::from_utf8(&slice[start_byte..end_byte])
+    let value = slice.get(start_byte..end_byte).ok_or_else(|| {
+        ArrowError::InvalidArgumentError(format!(
+            "Tried to extract byte(s) {}..{} from {}-byte buffer",
+            start_byte, end_byte, slice.len(),
+        ))
+    })?;
+
+    str::from_utf8(value)
         .map_err(|_| ArrowError::InvalidArgumentError("invalid UTF-8 string".to_string()))
 }
 
@@ -138,55 +147,55 @@ pub(crate) fn fits_precision<const N: u32>(n: impl Into<i64>) -> bool {
 }
 
 /// Decode variant primitive value
-pub(crate) fn decode_int8(data: &Bytes) -> Result<i8, ArrowError> {
+pub(crate) fn decode_int8(data: &Buffer) -> Result<i8, ArrowError> {
     Ok(i8::from_le_bytes(array_from_slice(data, 0)?))
 }
 
-pub(crate) fn decode_int16(data: &Bytes) -> Result<i16, ArrowError> {
+pub(crate) fn decode_int16(data: &Buffer) -> Result<i16, ArrowError> {
     Ok(i16::from_le_bytes(array_from_slice(data, 0)?))
 }
 
-pub(crate) fn decode_int32(data: &Bytes) -> Result<i32, ArrowError> {
+pub(crate) fn decode_int32(data: &Buffer) -> Result<i32, ArrowError> {
     Ok(i32::from_le_bytes(array_from_slice(data, 0)?))
 }
 
-pub(crate) fn decode_int64(data: &Bytes) -> Result<i64, ArrowError> {
+pub(crate) fn decode_int64(data: &Buffer) -> Result<i64, ArrowError> {
     Ok(i64::from_le_bytes(array_from_slice(data, 0)?))
 }
 
-pub(crate) fn decode_decimal4(data: &Bytes) -> Result<(i32, u8), ArrowError> {
+pub(crate) fn decode_decimal4(data: &Buffer) -> Result<(i32, u8), ArrowError> {
     let scale = u8::from_le_bytes(array_from_slice(data, 0)?);
     let integer = i32::from_le_bytes(array_from_slice(data, 1)?);
     Ok((integer, scale))
 }
 
-pub(crate) fn decode_decimal8(data: &Bytes) -> Result<(i64, u8), ArrowError> {
+pub(crate) fn decode_decimal8(data: &Buffer) -> Result<(i64, u8), ArrowError> {
     let scale = u8::from_le_bytes(array_from_slice(data, 0)?);
     let integer = i64::from_le_bytes(array_from_slice(data, 1)?);
     Ok((integer, scale))
 }
 
-pub(crate) fn decode_decimal16(data: &Bytes) -> Result<(i128, u8), ArrowError> {
+pub(crate) fn decode_decimal16(data: &Buffer) -> Result<(i128, u8), ArrowError> {
     let scale = u8::from_le_bytes(array_from_slice(data, 0)?);
     let integer = i128::from_le_bytes(array_from_slice(data, 1)?);
     Ok((integer, scale))
 }
 
-pub(crate) fn decode_float(data: &Bytes) -> Result<f32, ArrowError> {
+pub(crate) fn decode_float(data: &Buffer) -> Result<f32, ArrowError> {
     Ok(f32::from_le_bytes(array_from_slice(data, 0)?))
 }
 
-pub(crate) fn decode_double(data: &Bytes) -> Result<f64, ArrowError> {
+pub(crate) fn decode_double(data: &Buffer) -> Result<f64, ArrowError> {
     Ok(f64::from_le_bytes(array_from_slice(data, 0)?))
 }
 
-pub(crate) fn decode_date(data: &Bytes) -> Result<NaiveDate, ArrowError> {
+pub(crate) fn decode_date(data: &Buffer) -> Result<NaiveDate, ArrowError> {
     let days_since_epoch = i32::from_le_bytes(array_from_slice(data, 0)?);
     let value = DateTime::UNIX_EPOCH + Duration::days(i64::from(days_since_epoch));
     Ok(value.date_naive())
 }
 
-pub(crate) fn decode_timestamp_micros(data: &Bytes) -> Result<DateTime<Utc>, ArrowError> {
+pub(crate) fn decode_timestamp_micros(data: &Buffer) -> Result<DateTime<Utc>, ArrowError> {
     let micros_since_epoch = i64::from_le_bytes(array_from_slice(data, 0)?);
     DateTime::from_timestamp_micros(micros_since_epoch).ok_or_else(|| {
         ArrowError::CastError(format!(
@@ -195,7 +204,7 @@ pub(crate) fn decode_timestamp_micros(data: &Bytes) -> Result<DateTime<Utc>, Arr
     })
 }
 
-pub(crate) fn decode_timestampntz_micros(data: &Bytes) -> Result<NaiveDateTime, ArrowError> {
+pub(crate) fn decode_timestampntz_micros(data: &Buffer) -> Result<NaiveDateTime, ArrowError> {
     let micros_since_epoch = i64::from_le_bytes(array_from_slice(data, 0)?);
     DateTime::from_timestamp_micros(micros_since_epoch)
         .ok_or_else(|| {
@@ -206,7 +215,7 @@ pub(crate) fn decode_timestampntz_micros(data: &Bytes) -> Result<NaiveDateTime, 
         .map(|v| v.naive_utc())
 }
 
-pub(crate) fn decode_time_ntz(data: &Bytes) -> Result<NaiveTime, ArrowError> {
+pub(crate) fn decode_time_ntz(data: &Buffer) -> Result<NaiveTime, ArrowError> {
     let micros_since_epoch = u64::from_le_bytes(array_from_slice(data, 0)?);
 
     let case_error = ArrowError::CastError(format!(
@@ -225,28 +234,28 @@ pub(crate) fn decode_time_ntz(data: &Bytes) -> Result<NaiveTime, ArrowError> {
         .ok_or(case_error)
 }
 
-pub(crate) fn decode_timestamp_nanos(data: &Bytes) -> Result<DateTime<Utc>, ArrowError> {
+pub(crate) fn decode_timestamp_nanos(data: &Buffer) -> Result<DateTime<Utc>, ArrowError> {
     let nanos_since_epoch = i64::from_le_bytes(array_from_slice(data, 0)?);
 
     // DateTime::from_timestamp_nanos would never fail
     Ok(DateTime::from_timestamp_nanos(nanos_since_epoch))
 }
 
-pub(crate) fn decode_timestampntz_nanos(data: &Bytes) -> Result<NaiveDateTime, ArrowError> {
+pub(crate) fn decode_timestampntz_nanos(data: &Buffer) -> Result<NaiveDateTime, ArrowError> {
     decode_timestamp_nanos(data).map(|v| v.naive_utc())
 }
 
-pub(crate) fn decode_uuid(data: &Bytes) -> Result<Uuid, ArrowError> {
-    Uuid::from_slice(&data[0..16])
-        .map_err(|_| ArrowError::CastError(format!("Cant decode uuid from {:?}", &data[0..16])))
+pub(crate) fn decode_uuid(data: &Buffer) -> Result<Uuid, ArrowError> {
+    Uuid::from_slice(data.slice(0..16).as_ref())
+        .map_err(|_| ArrowError::CastError(format!("Cant decode uuid from {:?}", data.slice(0..16).as_ref())))
 }
 
-pub(crate) fn decode_binary(data: &Bytes) -> Result<Bytes, ArrowError> {
+pub(crate) fn decode_binary(data: &Buffer) -> Result<Buffer, ArrowError> {
     let len = u32::from_le_bytes(array_from_slice(data, 0)?) as usize;
     slice_from_slice_at_offset(data, 4, 0..len)
 }
 
-pub(crate) fn decode_string(data: &Bytes) -> Result<Bytes, ArrowError> {
+pub(crate) fn decode_string(data: &Buffer) -> Result<Buffer, ArrowError> {
     let len = u32::from_le_bytes(array_from_slice(data, 0)?) as usize;
     slice_from_slice_at_offset(data, 4, 0..len)
 }

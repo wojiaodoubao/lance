@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
+use std::sync::Arc;
 use arrow_array::{ArrayRef, StructArray};
 use arrow_array::cast::AsArray;
 use arrow_schema::ArrowError;
-use bytes::Bytes;
 use crate::DataTypeExt;
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::utils::{overflow_error, slice_from_slice, try_binary_search_range_by};
+use crate::variant::utils::{first_byte_from_slice, overflow_error, slice_from_slice, try_binary_search_range_by};
 use crate::variant::value::{VariantObjectHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::Variant;
+use crate::variant::{Buffer, Variant};
 
 #[derive(Debug, Clone)]
 pub enum VariantObject {
@@ -78,8 +78,8 @@ impl MergedVariantObject {
 
 #[derive(Debug, Clone)]
 pub struct EncodedObject {
-    pub metadata: VariantMetadata,
-    pub value: Bytes,
+    pub metadata: Arc<VariantMetadata>,
+    pub value: Buffer,
     header: VariantObjectHeader,
     num_elements: u32,
     first_field_offset_byte: u32,
@@ -87,11 +87,11 @@ pub struct EncodedObject {
 }
 
 impl EncodedObject {
-    pub fn try_new(metadata: VariantMetadata, header: Option<VariantObjectHeader>, value: Bytes) -> Result<Self, ArrowError> {
+    pub fn try_new(metadata: Arc<VariantMetadata>, header: Option<VariantObjectHeader>, value: Buffer) -> Result<Self, ArrowError> {
         let header = match header {
             Some(h) => h,
             None => {
-                let first_byte = value.first().ok_or(ArrowError::InvalidArgumentError("Variant value must have at least one byte".to_string()))?;
+                let first_byte = first_byte_from_slice(value.as_ref())?;
                 let value_meta = VariantValueMeta::try_from(first_byte)?;
                 match value_meta.header {
                     VariantValueHeader::Object(header) => header,
@@ -168,14 +168,14 @@ impl EncodedObject {
     }
 
     // Returns field id bytes.
-    fn field_id_bytes(&self) -> Result<Bytes, ArrowError> {
+    fn field_id_bytes(&self) -> Result<Buffer, ArrowError> {
         let field_id_start = 1 + self.num_elements as usize;
         let byte_range = field_id_start..self.first_field_offset_byte as usize;
         slice_from_slice(&self.value, byte_range)
     }
 
     // Returns field offset bytes.
-    fn field_offset_bytes(&self) -> Result<Bytes, ArrowError> {
+    fn field_offset_bytes(&self) -> Result<Buffer, ArrowError> {
         let byte_range = self.first_field_offset_byte as _..self.first_value_byte as _;
         slice_from_slice(&self.value, byte_range)
     }

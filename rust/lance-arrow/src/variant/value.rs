@@ -148,16 +148,16 @@ pub enum VariantValueHeader {
     List(VariantListHeader),
 }
 
-pub struct VariantValueMeta<'m> {
-    pub(crate) raw_byte: &'m u8,
+pub struct VariantValueMeta {
+    pub(crate) raw_byte: u8,
     pub(crate) header: VariantValueHeader,
     pub(crate) basic_type: VariantBasicType,
 }
 
-impl <'m> TryFrom<&'m u8> for VariantValueMeta<'m> {
+impl TryFrom<u8> for VariantValueMeta {
     type Error = ArrowError;
 
-    fn try_from(value: &'m u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
         let basic_type = VariantBasicType::try_from(value & 0x03)?;
         let header_value = value >> 2;
 

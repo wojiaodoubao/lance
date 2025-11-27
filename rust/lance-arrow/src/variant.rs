@@ -13,8 +13,9 @@ mod variant_array;
 
 use std::fmt::Debug;
 use std::fs::Metadata;
-use std::sync::LazyLock;
-use arrow_array::{Array, ArrayRef, GenericBinaryArray, LargeStringArray, StringArray};
+use std::ops::Range;
+use std::sync::{Arc, LazyLock};
+use arrow_array::{Array, ArrayAccessor, ArrayRef, BinaryArray, GenericBinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
 use arrow_array::cast::{as_list_array, AsArray};
 use arrow_array::types::{Date32Type, Decimal128Type, Decimal32Type, Decimal64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Time64MicrosecondType, TimestampMicrosecondType, TimestampNanosecondType};
 use arrow_schema::{ArrowError, DataType, Field as ArrowField, Field, Fields as ArrowFields, TimeUnit};
@@ -29,7 +30,7 @@ use crate::variant::metadata::VariantMetadata;
 use crate::variant::object::{EncodedObject, MergedVariantObject, VariantObject};
 use crate::variant::list::TypedList;
 use crate::variant::object::TypedObject;
-use crate::variant::utils::{decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double, decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_string, decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros, decode_timestampntz_nanos, decode_uuid, slice_from_slice, ListArrayExt};
+use crate::variant::utils::{decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double, decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_string, decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros, decode_timestampntz_nanos, decode_uuid, first_byte_from_slice, slice_from_slice, ListArrayExt};
 use crate::variant::value::{VariantPrimitiveType, VariantValueHeader, VariantValueMeta};
 
 /// Arrow extension type name for Variant data
@@ -105,7 +106,12 @@ impl ExtensionType for VariantType {
     }
 }
 
-/// TODO: add doc
+/// Represents a [Variant].
+///
+/// Variant Spec could be found at https://docs.google.com/document/d/1aXEoVlRYUMTIQ290Th-sL0kFy0-zwKhe5AKuYzXwjDc/edit?pli=1&tab=t.0
+/// Discussion could be found at https://github.com/lance-format/lance/discussions/5238.
+///
+/// TODO: complete this doc.
 #[derive(Debug, Clone)]
 pub enum Variant {
     /// Basic type: Primitive (basic_type_id=0).
@@ -159,32 +165,88 @@ pub enum Variant {
     Object(VariantObject),
 }
 
-impl Variant {
-    pub fn new(metadata: Bytes, value: Bytes, typed: &ArrayRef) -> Result<Self, ArrowError> {
-        let encoded = Self::new_encoded(metadata, value);
-        let typed = Self::new_typed(typed)?;
+/// Buffer is a binary array. The underlying data could be
+/// - Bytes
+/// - BinaryArray
+/// - LargeBinaryArray
+#[derive(Debug, Clone, PartialEq)]
+pub enum Buffer {
+    Bytes(Bytes),
+    BinaryArray(BinaryArray, Range<usize>),
+    LargeBinaryArray(LargeBinaryArray, Range<usize>),
+}
 
-        let v = match (encoded, typed) {
-            (Self::Object(VariantObject::Encoded(e)), Self::Object(VariantObject::Typed(t))) => {
-                Self::Object(VariantObject::Merged(MergedVariantObject::new(Some(e), Some(t))))
-            },
-            (e, Self::Null) => e,
-            (_, t) => t,
-        };
-        Ok(v)
+impl Buffer {
+    pub fn len(&self) -> usize {
+        self.as_ref().len()
     }
 
-    pub fn new_encoded(metadata: Bytes, value: Bytes) -> Self {
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        match self {
+            Self::Bytes(b) => Self::Bytes(b.slice(range)),
+            Self::BinaryArray(arr, r) => {
+                assert!(r.end >= r.start + range.end);
+                Self::BinaryArray(arr.clone(), r.start + range.start..r.start + range.end)
+            },
+            Self::LargeBinaryArray(arr, r) => {
+                assert!(r.end >= r.start + range.end);
+                Self::LargeBinaryArray(arr.clone(), r.start + range.start..r.start + range.end)
+            },
+        }
+    }
+}
+
+impl AsRef<[u8]> for Buffer {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(b) => b.as_ref(),
+            Self::BinaryArray(arr, r) => &arr.value(0)[r.start..r.end],
+            Self::LargeBinaryArray(arr, r) => &arr.value(0)[r.start..r.end],
+        }
+    }
+}
+
+impl Variant {
+    pub fn new(metadata: Buffer, value: Option<Buffer>, typed: Option<&ArrayRef>) -> Result<Self, ArrowError> {
+        match (value, typed) {
+            (Some(value), Some(typed)) => {
+                let encoded = Self::new_encoded(metadata, value);
+                let typed = Self::try_new_typed(typed)?;
+
+                let v = match (encoded, typed) {
+                    (Self::Object(VariantObject::Encoded(e)), Self::Object(VariantObject::Typed(t))) => {
+                        Self::Object(VariantObject::Merged(MergedVariantObject::new(Some(e), Some(t))))
+                    },
+                    (e, Self::Null) => e,
+                    (_, t) => t,
+                };
+                Ok(v)
+            },
+            (Some(value), None) => {
+                Ok(Self::new_encoded(metadata, value))
+            },
+            (None, Some(typed)) => {
+                Self::try_new_typed(typed)
+            },
+            (None, None) => Err(ArrowError::InvalidArgumentError("Variant must have value or typed".to_string())),
+        }
+    }
+
+    pub fn new_encoded(metadata: Buffer, value: Buffer) -> Self {
         let metadata = VariantMetadata::try_new(metadata)
             .expect("Invalid variant metadata");
-        Self::try_new_encoded(metadata, value).expect("Invalid variant data")
+        Self::try_new_encoded(Arc::new(metadata), value).expect("Invalid variant data")
     }
 
     fn try_new_encoded(
-        metadata: VariantMetadata,
-        value: Bytes,
+        metadata: Arc<VariantMetadata>,
+        value: Buffer,
     ) -> Result<Self, ArrowError> {
-        let first_byte = value.first().ok_or(ArrowError::InvalidArgumentError("Variant value must have at least one byte".to_string()))?;
+        let first_byte = first_byte_from_slice(value.as_ref())?;
         let value_meta = VariantValueMeta::try_from(first_byte)?;
         let value_data = slice_from_slice(&value, 1..value.len())?;
 
@@ -249,25 +311,7 @@ impl Variant {
         }
     }
 
-    /// Create a variant from a shredding array. The shredding array must have exactly one element
-    /// and the element must be a struct with exactly one field named "root".
-    pub fn new_typed(value: &ArrayRef) -> Result<Self, ArrowError> {
-        if value.len() != 1 {
-            return Err(ArrowError::InvalidArgumentError("Variant value must have exactly one element".to_string()));
-        }
-
-        let data_type = value.data_type();
-        match data_type {
-            DataType::Struct(fields) if fields.len() == 1 && fields[0].name() == "root" => {
-                let struct_array = value.as_struct();
-                let root_field = struct_array.column_by_name("root")
-                    .ok_or_else(|| ArrowError::InvalidArgumentError("root field not found".to_string()))?;
-                Self::try_new_typed(root_field)
-            },
-            _ => Err(ArrowError::InvalidArgumentError("The root variant type must be a struct with exactly one root field".to_string()))
-        }
-    }
-
+    /// Create a variant from a shredding array. The shredding array must have exactly one element.
     fn try_new_typed(value: &ArrayRef) -> Result<Self, ArrowError> {
         if (matches!(value.data_type(), DataType::List(_)) && as_list_array(value).num_items() != 1) || value.len() != 1 {
             return Err(ArrowError::InvalidArgumentError("Variant value must have exactly one element".to_string()));
@@ -371,14 +415,14 @@ impl Variant {
 
 #[derive(Debug, Clone)]
 pub enum VariantBinary {
-    Bytes(Bytes),
+    Buffer(Buffer),
     Binary(GenericBinaryArray<i32>),
     LargeBinary(GenericBinaryArray<i64>),
 }
 
-impl From<Bytes> for VariantBinary {
-    fn from(bytes: Bytes) -> Self {
-        Self::Bytes(bytes)
+impl From<Buffer> for VariantBinary {
+    fn from(bytes: Buffer) -> Self {
+        Self::Buffer(bytes)
     }
 }
 
@@ -397,7 +441,7 @@ impl From<GenericBinaryArray<i64>> for VariantBinary {
 impl AsRef<[u8]> for VariantBinary {
     fn as_ref(&self) -> &[u8] {
         match self {
-            Self::Bytes(bytes) => bytes,
+            Self::Buffer(bytes) => bytes.as_ref(),
             Self::Binary(arr) => arr.value(0),
             Self::LargeBinary(arr) => arr.value(0),
         }
@@ -406,14 +450,14 @@ impl AsRef<[u8]> for VariantBinary {
 
 #[derive(Debug, Clone)]
 pub enum VariantString {
-    Bytes(Bytes),
+    Buffer(Buffer),
     String(StringArray),
     LargeString(LargeStringArray),
 }
 
-impl From<Bytes> for VariantString {
-    fn from(value: Bytes) -> Self {
-        Self::Bytes(value)
+impl From<Buffer> for VariantString {
+    fn from(value: Buffer) -> Self {
+        Self::Buffer(value)
     }
 }
 
@@ -432,7 +476,7 @@ impl From<LargeStringArray> for VariantString {
 impl AsRef<str> for VariantString {
     fn as_ref(&self) -> &str {
         match self {
-            Self::Bytes(bytes) => str::from_utf8(bytes).unwrap(),
+            Self::Buffer(bytes) => str::from_utf8(bytes.as_ref()).unwrap(),
             Self::String(arr) => arr.value(0),
             Self::LargeString(arr) => arr.value(0),
         }

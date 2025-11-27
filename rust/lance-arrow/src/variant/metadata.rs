@@ -2,9 +2,9 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
 use arrow_schema::ArrowError;
-use bytes::Bytes;
+use crate::variant::Buffer;
 use crate::variant::metadata::OffsetSizeBytes::{Four, One, Three, Two};
-use crate::variant::utils::{array_from_slice, overflow_error, slice_from_slice, string_from_slice};
+use crate::variant::utils::{array_from_slice, first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice};
 
 /// Used to unpack offset array entries such as metadata dictionary offsets, object/array value
 /// offsets and object field ids. These are derived from a two-bit `XXX_size_minus_one` field.
@@ -44,7 +44,7 @@ impl OffsetSizeBytes {
     /// Each value is `self as u32` bytes wide (1, 2, 3 or 4), zero-extended to 32 bits as needed.
     pub(crate) fn unpack_u32_at_offset(
         &self,
-        bytes: &Bytes,
+        bytes: &Buffer,
         byte_offset: usize,  // how many bytes to skip
         offset_index: usize, // which offset in an array of offsets
     ) -> Result<u32, ArrowError> {
@@ -149,7 +149,7 @@ impl VariantMetadataHeader {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VariantMetadata {
     /// (Only) the bytes that make up this metadata instance.
-    pub(crate) bytes: Bytes,
+    pub(crate) bytes: Buffer,
     header: VariantMetadataHeader,
     dictionary_size: u32,
     first_value_byte: u32,
@@ -157,10 +157,10 @@ pub struct VariantMetadata {
 
 impl VariantMetadata {
     // TODO: add unit tests
-    pub(crate) fn try_new(bytes: Bytes) -> Result<Self, ArrowError> {
+    pub(crate) fn try_new(bytes: Buffer) -> Result<Self, ArrowError> {
         // Parse header
-        let header_byte = bytes.first().ok_or(ArrowError::InvalidArgumentError("Variant metadata must have at least one byte".to_string()))?;
-        let header = VariantMetadataHeader::try_new(header_byte)?;
+        let header_byte = first_byte_from_slice(bytes.as_ref())?;
+        let header = VariantMetadataHeader::try_new(&header_byte)?;
 
         // Dictionary size is the first element after header.
         let dictionary_size =
@@ -190,7 +190,7 @@ impl VariantMetadata {
     /// underlying bytes are [invalid].
     pub fn get_name(&self, i: usize) -> Result<&str, ArrowError> {
         let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
-        string_from_slice(&self.bytes, self.first_value_byte as _, byte_range)
+        string_from_slice(self.bytes.as_ref(), self.first_value_byte as _, byte_range)
     }
 
     /// Gets offset of the dictionary entry by index.
