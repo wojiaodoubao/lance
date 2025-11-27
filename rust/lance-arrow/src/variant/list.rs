@@ -9,7 +9,22 @@ use num_traits::ToPrimitive;
 use crate::variant::metadata::VariantMetadata;
 use crate::variant::utils::{overflow_error, slice_from_slice, ListArrayExt};
 use crate::variant::value::{VariantListHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::{VariantList, Variant};
+use crate::variant::Variant;
+
+#[derive(Debug, Clone)]
+pub enum VariantList {
+    Encoded(EncodedList),
+    Typed(TypedList),
+}
+
+impl VariantList {
+    pub fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
+        match self {
+            Self::Encoded(encoded) => encoded.try_field_with_index(i),
+            Self::Typed(typed) => typed.try_field_with_index(i),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EncodedList {
@@ -18,29 +33,6 @@ pub struct EncodedList {
     header: VariantListHeader,
     num_elements: u32,
     first_value_byte: u32,
-}
-
-impl VariantList for EncodedList {
-    /// Get a field's value by index.
-    fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
-        if i < self.num_elements as usize {
-            let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
-
-            let start_byte = self.first_value_byte
-                .checked_add(byte_range.start)
-                .ok_or_else(|| overflow_error("slice start"))? as usize;
-            // TODO: 不需要end_byte，直接截到尾巴就可以。
-            // let end_byte = self.first_value_byte
-            //     .checked_add(byte_range.end)
-            //     .ok_or_else(|| overflow_error("slice end"))? as usize;
-
-            let value_bytes =
-                slice_from_slice(&self.value, start_byte..self.value.len())?;
-            Variant::try_new_encoded(self.metadata.clone(), value_bytes)
-        } else {
-            Err(ArrowError::InvalidArgumentError(format!("Variant list index {} out of bounds", i)))
-        }
-    }
 }
 
 impl EncodedList {
@@ -79,6 +71,27 @@ impl EncodedList {
         })
     }
 
+    /// Get a field's value by index.
+    pub fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
+        if i < self.num_elements as usize {
+            let byte_range = self.get_offset(i)? as _..self.get_offset(i + 1)? as _;
+
+            let start_byte = self.first_value_byte
+                .checked_add(byte_range.start)
+                .ok_or_else(|| overflow_error("slice start"))? as usize;
+            // TODO: 不需要end_byte，直接截到尾巴就可以。
+            // let end_byte = self.first_value_byte
+            //     .checked_add(byte_range.end)
+            //     .ok_or_else(|| overflow_error("slice end"))? as usize;
+
+            let value_bytes =
+                slice_from_slice(&self.value, start_byte..self.value.len())?;
+            Variant::try_new_encoded(self.metadata.clone(), value_bytes)
+        } else {
+            Err(ArrowError::InvalidArgumentError(format!("Variant list index {} out of bounds", i)))
+        }
+    }
+
     fn get_offset(&self, index: usize) -> Result<u32, ArrowError> {
         let first_offset_byte = 1 + self.header.num_elements_size as usize;
         let byte_range = first_offset_byte..self.first_value_byte as _;
@@ -87,6 +100,7 @@ impl EncodedList {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct TypedList {
     pub value: ListArray,
 }
@@ -108,10 +122,8 @@ impl TypedList {
 
         Ok(Self { value: value.clone() })
     }
-}
 
-impl VariantList for TypedList {
-    fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
+    pub fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
         let start = self.value
             .offsets()
             .get(i)

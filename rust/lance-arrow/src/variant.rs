@@ -11,6 +11,8 @@ pub mod utils;
 mod value;
 mod variant_array;
 
+use std::fmt::Debug;
+use std::fs::Metadata;
 use std::sync::LazyLock;
 use arrow_array::{Array, ArrayRef, GenericBinaryArray, LargeStringArray, StringArray};
 use arrow_array::cast::{as_list_array, AsArray};
@@ -22,9 +24,9 @@ use serde::{Deserialize, Serialize};
 use crate::variant::decimal::{VariantDecimal16, VariantDecimal4, VariantDecimal8};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 pub use uuid::Uuid;
-use crate::variant::list::EncodedList;
+use crate::variant::list::{EncodedList, VariantList};
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::object::EncodedObject;
+use crate::variant::object::{EncodedObject, MergedVariantObject, VariantObject};
 use crate::variant::list::TypedList;
 use crate::variant::object::TypedObject;
 use crate::variant::utils::{decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double, decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_string, decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros, decode_timestampntz_nanos, decode_uuid, slice_from_slice, ListArrayExt};
@@ -104,6 +106,7 @@ impl ExtensionType for VariantType {
 }
 
 /// TODO: add doc
+#[derive(Debug, Clone)]
 pub enum Variant {
     /// Basic type: Primitive (basic_type_id=0).
     /// Primitive type(type_id=0): NULL
@@ -150,21 +153,27 @@ pub enum Variant {
     TimestampNtzNanos(NaiveDateTime),
 
     /// Basic type: List (basic_type_id=1).
-    List(Box<dyn VariantList>),
+    List(VariantList),
 
     /// Basic type: Object (basic_type_id=2).
-    Object(Box<dyn VariantObject>),
-}
-
-pub trait VariantObject {
-    fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError>;
-}
-
-pub trait VariantList {
-    fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError>;
+    Object(VariantObject),
 }
 
 impl Variant {
+    pub fn new(metadata: Bytes, value: Bytes, typed: &ArrayRef) -> Result<Self, ArrowError> {
+        let encoded = Self::new_encoded(metadata, value);
+        let typed = Self::new_typed(typed)?;
+
+        let v = match (encoded, typed) {
+            (Self::Object(VariantObject::Encoded(e)), Self::Object(VariantObject::Typed(t))) => {
+                Self::Object(VariantObject::Merged(MergedVariantObject::new(Some(e), Some(t))))
+            },
+            (e, Self::Null) => e,
+            (_, t) => t,
+        };
+        Ok(v)
+    }
+
     pub fn new_encoded(metadata: Bytes, value: Bytes) -> Self {
         let metadata = VariantMetadata::try_new(metadata)
             .expect("Invalid variant metadata");
@@ -231,11 +240,11 @@ impl Variant {
             },
             VariantValueHeader::Object(header) => {
                 let object = EncodedObject::try_new(metadata, Some(header), value_data)?;
-                Ok(Self::Object(Box::new(object)))
+                Ok(Self::Object(VariantObject::Encoded(object)))
             },
             VariantValueHeader::List(header) => {
                 let list = EncodedList::try_new(metadata, Some(header), &value_data)?;
-                Ok(Self::List(Box::new(list)))
+                Ok(Self::List(VariantList::Encoded(list)))
             }
         }
     }
@@ -268,11 +277,11 @@ impl Variant {
         match data_type {
             // object
             DataType::Struct(_) => {
-                Ok(Self::Object(Box::new(TypedObject::try_new(value)?)))
+                Ok(Self::Object(VariantObject::Typed(TypedObject::try_new(value)?)))
             },
             // list
             DataType::List(_) => {
-                Ok(Self::List(Box::new(TypedList::try_new(value)?)))
+                Ok(Self::List(VariantList::Typed(TypedList::try_new(value)?)))
             },
             // primitive
             DataType::Null => Ok(Self::Null),
@@ -354,8 +363,13 @@ impl Variant {
             _ => Err(ArrowError::InvalidArgumentError(format!("Invalid datatype: {:?}", data_type))),
         }
     }
+
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
 }
 
+#[derive(Debug, Clone)]
 pub enum VariantBinary {
     Bytes(Bytes),
     Binary(GenericBinaryArray<i32>),
@@ -390,6 +404,7 @@ impl AsRef<[u8]> for VariantBinary {
     }
 }
 
+#[derive(Debug, Clone)]
 pub enum VariantString {
     Bytes(Bytes),
     String(StringArray),

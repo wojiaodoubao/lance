@@ -9,7 +9,72 @@ use crate::DataTypeExt;
 use crate::variant::metadata::VariantMetadata;
 use crate::variant::utils::{overflow_error, slice_from_slice, try_binary_search_range_by};
 use crate::variant::value::{VariantObjectHeader, VariantValueHeader, VariantValueMeta};
-use crate::variant::{VariantObject, Variant};
+use crate::variant::Variant;
+
+#[derive(Debug, Clone)]
+pub enum VariantObject {
+    Merged(MergedVariantObject),
+    Encoded(EncodedObject),
+    Typed(TypedObject),
+}
+
+impl VariantObject {
+    pub fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
+        match self {
+            Self::Merged(core) => core.try_field_with_name(name),
+            Self::Encoded(encoded) => encoded.try_field_with_name(name),
+            Self::Typed(typed) => typed.try_field_with_name(name),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MergedVariantObject {
+    encoded_value: Option<EncodedObject>,
+    typed_value: Option<TypedObject>,
+}
+
+impl MergedVariantObject {
+    pub fn new(encoded_value: Option<EncodedObject>, typed_value: Option<TypedObject>) -> Self {
+        Self {
+            encoded_value,
+            typed_value,
+        }
+    }
+
+    pub fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
+        let encoded = if let Some(encoded_value) = &self.encoded_value {
+            encoded_value.try_field_with_name(name)?
+        } else {
+            Variant::Null
+        };
+
+        let typed = if let Some(typed_value) = &self.typed_value {
+            typed_value.try_field_with_name(name)?
+        } else {
+            Variant::Null
+        };
+
+        if encoded.is_null() && typed.is_null() {
+            Ok(Variant::Null)
+        } else if typed.is_null() {
+            Ok(encoded)
+        } else if encoded.is_null() {
+            Ok(typed)
+        } else {
+            let v = match (encoded, typed) {
+                (Variant::Object(VariantObject::Encoded(e)), Variant::Object(VariantObject::Typed(t))) => {
+                    Variant::Object(VariantObject::Merged(Self {
+                        encoded_value: Some(e),
+                        typed_value: Some(t),
+                    }))
+                }
+                (_, t) => t,
+            };
+            Ok(v)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct EncodedObject {
@@ -19,23 +84,6 @@ pub struct EncodedObject {
     num_elements: u32,
     first_field_offset_byte: u32,
     first_value_byte: u32,
-}
-
-impl VariantObject for EncodedObject {
-    /// Get a field's value by name.
-    fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
-        let cmp = |i| {
-            match self.try_field_name(i) {
-                Ok(f) => Some(f.cmp(name)),
-                Err(_) => None,
-            }
-        };
-
-        match try_binary_search_range_by(0..self.num_elements as usize, cmp) {
-            Some(Ok(index)) => Ok(self.try_field_with_index(index)?),
-            _ => Err(ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))),
-        }
-    }
 }
 
 impl EncodedObject {
@@ -81,6 +129,21 @@ impl EncodedObject {
         })
     }
 
+    /// Get a field's value by name.
+    pub fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
+        let cmp = |i| {
+            match self.try_field_name(i) {
+                Ok(f) => Some(f.cmp(name)),
+                Err(_) => None,
+            }
+        };
+
+        match try_binary_search_range_by(0..self.num_elements as usize, cmp) {
+            Some(Ok(index)) => Ok(self.try_field_with_index(index)?),
+            _ => Err(ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))),
+        }
+    }
+
     /// Get a field's value by index.
     fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
         if i < self.num_elements as usize {
@@ -118,6 +181,7 @@ impl EncodedObject {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct TypedObject {
     pub value: StructArray,
 }
@@ -133,10 +197,8 @@ impl TypedObject {
         let value = value.as_struct();
         Ok(Self { value: value.clone() })
     }
-}
 
-impl VariantObject for TypedObject {
-    fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
+    pub fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
         let arr = self.value.column_by_name(name).ok_or_else(|| {
             ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))
         })?;
