@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::ArrowError;
-use crate::variant::Buffer;
 use crate::variant::metadata::OffsetSizeBytes::{Four, One, Three, Two};
-use crate::variant::utils::{array_from_slice, first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice};
+use crate::variant::utils::{
+    array_from_slice, first_byte_from_slice, overflow_error, slice_from_slice, string_from_slice,
+};
+use crate::variant::Buffer;
+use arrow_schema::ArrowError;
+use std::collections::HashMap;
 
 /// Used to unpack offset array entries such as metadata dictionary offsets, object/array value
 /// offsets and object field ids. These are derived from a two-bit `XXX_size_minus_one` field.
@@ -163,10 +166,7 @@ impl VariantMetadata {
         let header = VariantMetadataHeader::try_new(&header_byte)?;
 
         // Dictionary size is the first element after header.
-        let dictionary_size =
-            header
-                .offset_size
-                .unpack_u32_at_offset(&bytes, 1, 0)?;
+        let dictionary_size = header.offset_size.unpack_u32_at_offset(&bytes, 1, 0)?;
 
         // first_value_byte = header size(1Byte) + offset_size + (dict_size + 1) * offset_size
         //
@@ -199,5 +199,13 @@ impl VariantMetadata {
         let offset_byte_range = offset_byte_start..self.first_value_byte as usize;
         let bytes = slice_from_slice(&self.bytes, offset_byte_range)?;
         self.header.offset_size.unpack_u32_at_offset(&bytes, 0, i)
+    }
+
+    pub fn name_to_index(&self) -> Result<HashMap<&str, usize>, ArrowError> {
+        let mut dict = HashMap::with_capacity(self.dictionary_size as usize);
+        for i in 0..self.dictionary_size as usize {
+            dict.insert(self.get_name(i)?, i);
+        }
+        Ok(dict)
     }
 }

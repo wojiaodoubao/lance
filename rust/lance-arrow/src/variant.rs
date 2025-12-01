@@ -4,57 +4,65 @@
 //! Lance Variant support.
 
 pub mod decimal;
-pub mod object;
-pub mod metadata;
+mod encoding;
 pub mod list;
+pub mod metadata;
+pub mod object;
 pub mod utils;
 mod value;
 mod variant_array;
 
+use crate::variant::decimal::{VariantDecimal16, VariantDecimal4, VariantDecimal8};
+use crate::variant::encoding::{MetaEncoder, ValueEncoder};
+use crate::variant::list::TypedList;
+use crate::variant::list::{EncodedList, VariantList};
+use crate::variant::metadata::VariantMetadata;
+use crate::variant::object::TypedObject;
+use crate::variant::object::{EncodedObject, MergedVariantObject, VariantObject};
+use crate::variant::utils::{
+    decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double,
+    decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_string,
+    decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros,
+    decode_timestampntz_nanos, decode_uuid, first_byte_from_slice, slice_from_slice,
+};
+use crate::variant::value::{VariantPrimitiveType, VariantValueHeader, VariantValueMeta};
+use arrow_array::cast::{as_list_array, AsArray};
+use arrow_array::types::{
+    Date32Type, Decimal128Type, Decimal32Type, Decimal64Type, Float16Type, Float32Type,
+    Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Time64MicrosecondType,
+    TimestampMicrosecondType, TimestampNanosecondType,
+};
+use arrow_array::{
+    Array, ArrayAccessor, ArrayRef, BinaryArray, GenericBinaryArray, LargeBinaryArray,
+    LargeStringArray, StringArray,
+};
+use arrow_schema::extension::ExtensionType;
+use arrow_schema::{
+    ArrowError, DataType, Field as ArrowField, Field, Fields as ArrowFields, TimeUnit,
+};
+use bytes::Bytes;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 use std::fs::Metadata;
 use std::ops::Range;
 use std::sync::{Arc, LazyLock};
-use arrow_array::{Array, ArrayAccessor, ArrayRef, BinaryArray, GenericBinaryArray, LargeBinaryArray, LargeStringArray, StringArray};
-use arrow_array::cast::{as_list_array, AsArray};
-use arrow_array::types::{Date32Type, Decimal128Type, Decimal32Type, Decimal64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, Time64MicrosecondType, TimestampMicrosecondType, TimestampNanosecondType};
-use arrow_schema::{ArrowError, DataType, Field as ArrowField, Field, Fields as ArrowFields, TimeUnit};
-use arrow_schema::extension::ExtensionType;
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
-use crate::variant::decimal::{VariantDecimal16, VariantDecimal4, VariantDecimal8};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Timelike, Utc};
 pub use uuid::Uuid;
-use crate::variant::list::{EncodedList, VariantList};
-use crate::variant::metadata::VariantMetadata;
-use crate::variant::object::{EncodedObject, MergedVariantObject, VariantObject};
-use crate::variant::list::TypedList;
-use crate::variant::object::TypedObject;
-use crate::variant::utils::{decode_binary, decode_date, decode_decimal16, decode_decimal4, decode_decimal8, decode_double, decode_float, decode_int16, decode_int32, decode_int64, decode_int8, decode_string, decode_time_ntz, decode_timestamp_micros, decode_timestamp_nanos, decode_timestampntz_micros, decode_timestampntz_nanos, decode_uuid, first_byte_from_slice, slice_from_slice, ListArrayExt};
-use crate::variant::value::{VariantPrimitiveType, VariantValueHeader, VariantValueMeta};
 
 /// Arrow extension type name for Variant data
 pub const VARIANT_EXT_NAME: &str = "lance.variant";
 
-pub static VARIANT_DATA_TYPE: LazyLock<DataType> =
-    LazyLock::new(|| DataType::Struct(ArrowFields::from(vec![
-        ArrowField::new(
-            "meta",
-            DataType::Binary,
-            true),
-        ArrowField::new(
-            "value",
-            DataType::Binary,
-            true),
-        ArrowField::new(
-            "typed",
-            DataType::Struct(ArrowFields::empty()),
-            true),
-    ])));
+pub static VARIANT_DATA_TYPE: LazyLock<DataType> = LazyLock::new(|| {
+    DataType::Struct(ArrowFields::from(vec![
+        ArrowField::new("meta", DataType::Binary, true),
+        ArrowField::new("value", DataType::Binary, true),
+        ArrowField::new("typed", DataType::Struct(ArrowFields::empty()), true),
+    ]))
+});
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 enum VariantVersion {
-    V1
+    V1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,14 +87,13 @@ impl ExtensionType for VariantType {
 
     fn deserialize_metadata(metadata: Option<&str>) -> Result<Self::Metadata, ArrowError> {
         const ERR: &str = "Lance variant extension type metadata is invalid";
-        metadata
-            .map_or_else(
-                || Err(ArrowError::InvalidArgumentError(ERR.to_owned())),
-                |metadata| {
-                    serde_json::from_str::<VariantMeta>(metadata)
-                        .map_err(|_| ArrowError::InvalidArgumentError(ERR.to_owned()))
-                },
-            )
+        metadata.map_or_else(
+            || Err(ArrowError::InvalidArgumentError(ERR.to_owned())),
+            |metadata| {
+                serde_json::from_str::<VariantMeta>(metadata)
+                    .map_err(|_| ArrowError::InvalidArgumentError(ERR.to_owned()))
+            },
+        )
     }
 
     fn supports_data_type(&self, data_type: &DataType) -> Result<(), ArrowError> {
@@ -103,6 +110,51 @@ impl ExtensionType for VariantType {
         let variant = Self(metadata);
         variant.supports_data_type(data_type)?;
         Ok(variant)
+    }
+}
+
+/// Buffer is a binary array. The underlying data could be
+/// - Bytes
+/// - BinaryArray
+/// - LargeBinaryArray
+#[derive(Debug, Clone, PartialEq)]
+pub enum Buffer {
+    Bytes(Bytes),
+    BinaryArray(BinaryArray, Range<usize>),
+    LargeBinaryArray(LargeBinaryArray, Range<usize>),
+}
+
+impl Buffer {
+    pub fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn slice(&self, range: Range<usize>) -> Self {
+        match self {
+            Self::Bytes(b) => Self::Bytes(b.slice(range)),
+            Self::BinaryArray(arr, r) => {
+                assert!(r.end >= r.start + range.end);
+                Self::BinaryArray(arr.clone(), r.start + range.start..r.start + range.end)
+            }
+            Self::LargeBinaryArray(arr, r) => {
+                assert!(r.end >= r.start + range.end);
+                Self::LargeBinaryArray(arr.clone(), r.start + range.start..r.start + range.end)
+            }
+        }
+    }
+}
+
+impl AsRef<[u8]> for Buffer {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Bytes(b) => b.as_ref(),
+            Self::BinaryArray(arr, r) => &arr.value(0)[r.start..r.end],
+            Self::LargeBinaryArray(arr, r) => &arr.value(0)[r.start..r.end],
+        }
     }
 }
 
@@ -165,87 +217,46 @@ pub enum Variant {
     Object(VariantObject),
 }
 
-/// Buffer is a binary array. The underlying data could be
-/// - Bytes
-/// - BinaryArray
-/// - LargeBinaryArray
-#[derive(Debug, Clone, PartialEq)]
-pub enum Buffer {
-    Bytes(Bytes),
-    BinaryArray(BinaryArray, Range<usize>),
-    LargeBinaryArray(LargeBinaryArray, Range<usize>),
-}
-
-impl Buffer {
-    pub fn len(&self) -> usize {
-        self.as_ref().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    pub fn slice(&self, range: Range<usize>) -> Self {
-        match self {
-            Self::Bytes(b) => Self::Bytes(b.slice(range)),
-            Self::BinaryArray(arr, r) => {
-                assert!(r.end >= r.start + range.end);
-                Self::BinaryArray(arr.clone(), r.start + range.start..r.start + range.end)
-            },
-            Self::LargeBinaryArray(arr, r) => {
-                assert!(r.end >= r.start + range.end);
-                Self::LargeBinaryArray(arr.clone(), r.start + range.start..r.start + range.end)
-            },
-        }
-    }
-}
-
-impl AsRef<[u8]> for Buffer {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            Self::Bytes(b) => b.as_ref(),
-            Self::BinaryArray(arr, r) => &arr.value(0)[r.start..r.end],
-            Self::LargeBinaryArray(arr, r) => &arr.value(0)[r.start..r.end],
-        }
-    }
-}
-
 impl Variant {
-    pub fn new(metadata: Buffer, value: Option<Buffer>, typed: Option<&ArrayRef>) -> Result<Self, ArrowError> {
+    /// Create a new variant from metadata, value and typed value.
+    pub fn new(
+        metadata: Buffer,
+        value: Option<Buffer>,
+        typed: Option<&ArrayRef>,
+    ) -> Result<Self, ArrowError> {
         match (value, typed) {
             (Some(value), Some(typed)) => {
                 let encoded = Self::new_encoded(metadata, value);
                 let typed = Self::try_new_typed(typed)?;
 
                 let v = match (encoded, typed) {
-                    (Self::Object(VariantObject::Encoded(e)), Self::Object(VariantObject::Typed(t))) => {
-                        Self::Object(VariantObject::Merged(MergedVariantObject::new(Some(e), Some(t))))
-                    },
+                    (
+                        Self::Object(VariantObject::Encoded(e)),
+                        Self::Object(VariantObject::Typed(t)),
+                    ) => Self::Object(VariantObject::Merged(MergedVariantObject::new(
+                        Some(e),
+                        Some(t),
+                    ))),
                     (e, Self::Null) => e,
                     (_, t) => t,
                 };
                 Ok(v)
-            },
-            (Some(value), None) => {
-                Ok(Self::new_encoded(metadata, value))
-            },
-            (None, Some(typed)) => {
-                Self::try_new_typed(typed)
-            },
-            (None, None) => Err(ArrowError::InvalidArgumentError("Variant must have value or typed".to_string())),
+            }
+            (Some(value), None) => Ok(Self::new_encoded(metadata, value)),
+            (None, Some(typed)) => Self::try_new_typed(typed),
+            (None, None) => Err(ArrowError::InvalidArgumentError(
+                "Variant must have value or typed".to_string(),
+            )),
         }
     }
 
+    /// Create a new variant from encoded data.
     pub fn new_encoded(metadata: Buffer, value: Buffer) -> Self {
-        let metadata = VariantMetadata::try_new(metadata)
-            .expect("Invalid variant metadata");
+        let metadata = VariantMetadata::try_new(metadata).expect("Invalid variant metadata");
         Self::try_new_encoded(Arc::new(metadata), value).expect("Invalid variant data")
     }
 
-    fn try_new_encoded(
-        metadata: Arc<VariantMetadata>,
-        value: Buffer,
-    ) -> Result<Self, ArrowError> {
+    fn try_new_encoded(metadata: Arc<VariantMetadata>, value: Buffer) -> Result<Self, ArrowError> {
         let first_byte = first_byte_from_slice(value.as_ref())?;
         let value_meta = VariantValueMeta::try_from(first_byte)?;
         let value_data = slice_from_slice(&value, 1..value.len())?;
@@ -271,9 +282,7 @@ impl Variant {
                         Self::Decimal16(VariantDecimal16::try_new(integer, scale)?)
                     }
                     VariantPrimitiveType::Float => Self::Float(decode_float(&value_data)?),
-                    VariantPrimitiveType::Double => {
-                        Self::Double(decode_double(&value_data)?)
-                    }
+                    VariantPrimitiveType::Double => Self::Double(decode_double(&value_data)?),
                     VariantPrimitiveType::BooleanTrue => Self::BooleanTrue,
                     VariantPrimitiveType::BooleanFalse => Self::BooleanFalse,
                     VariantPrimitiveType::Date => Self::Date(decode_date(&value_data)?),
@@ -299,11 +308,11 @@ impl Variant {
                     VariantPrimitiveType::TimeNTZ => Self::Time(decode_time_ntz(&value_data)?),
                 };
                 Ok(variant)
-            },
+            }
             VariantValueHeader::Object(header) => {
                 let object = EncodedObject::try_new(metadata, Some(header), value_data)?;
                 Ok(Self::Object(VariantObject::Encoded(object)))
-            },
+            }
             VariantValueHeader::List(header) => {
                 let list = EncodedList::try_new(metadata, Some(header), &value_data)?;
                 Ok(Self::List(VariantList::Encoded(list)))
@@ -313,20 +322,22 @@ impl Variant {
 
     /// Create a variant from a shredding array. The shredding array must have exactly one element.
     fn try_new_typed(value: &ArrayRef) -> Result<Self, ArrowError> {
-        if (matches!(value.data_type(), DataType::List(_)) && as_list_array(value).num_items() != 1) || value.len() != 1 {
-            return Err(ArrowError::InvalidArgumentError("Variant value must have exactly one element".to_string()));
+        if (matches!(value.data_type(), DataType::List(_)) && as_list_array(value).len() != 1)
+            || value.len() != 1
+        {
+            return Err(ArrowError::InvalidArgumentError(
+                "Variant value must have exactly one element".to_string(),
+            ));
         }
 
         let data_type = value.data_type();
         match data_type {
             // object
-            DataType::Struct(_) => {
-                Ok(Self::Object(VariantObject::Typed(TypedObject::try_new(value)?)))
-            },
+            DataType::Struct(_) => Ok(Self::Object(VariantObject::Typed(TypedObject::try_new(
+                value,
+            )?))),
             // list
-            DataType::List(_) => {
-                Ok(Self::List(VariantList::Typed(TypedList::try_new(value)?)))
-            },
+            DataType::List(_) => Ok(Self::List(VariantList::Typed(TypedList::try_new(value)?))),
             // primitive
             DataType::Null => Ok(Self::Null),
             DataType::Boolean => Ok(Self::from(value.as_boolean().value(0))),
@@ -339,7 +350,7 @@ impl Variant {
             DataType::Binary => {
                 let value = value.as_binary_opt::<i32>().unwrap();
                 Ok(Self::Binary(VariantBinary::from(value.clone())))
-            },
+            }
             DataType::LargeBinary => {
                 let value = value.as_binary_opt::<i64>().unwrap();
                 Ok(Self::Binary(VariantBinary::from(value.clone())))
@@ -347,11 +358,11 @@ impl Variant {
             DataType::Utf8 => {
                 let value = value.as_string::<i32>();
                 Ok(Self::String(VariantString::from(value.clone())))
-            },
+            }
             DataType::LargeUtf8 => {
                 let value = value.as_string::<i64>();
                 Ok(Self::String(VariantString::from(value.clone())))
-            },
+            }
             DataType::Int8 => Ok(Self::from(value.as_primitive::<Int8Type>().value(0))),
             DataType::Int16 => Ok(Self::from(value.as_primitive::<Int16Type>().value(0))),
             DataType::Int32 => Ok(Self::from(value.as_primitive::<Int32Type>().value(0))),
@@ -381,20 +392,26 @@ impl Variant {
                     (value / 1_000_000) as u32,
                     (value % 1_000_000) as u32 * 1000,
                 )
-                    .ok_or_else(|| ArrowError::InvalidArgumentError(format!("Invalid microsecond: {}", value)))
-                    .map(Self::from)
+                .ok_or_else(|| {
+                    ArrowError::InvalidArgumentError(format!("Invalid microsecond: {}", value))
+                })
+                .map(Self::from)
             }
             DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => {
                 let value = value.as_primitive::<TimestampMicrosecondType>().value(0);
                 DateTime::from_timestamp_micros(value)
-                    .ok_or_else(|| ArrowError::InvalidArgumentError(format!("Invalid microsecond: {}", value)))
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError(format!("Invalid microsecond: {}", value))
+                    })
                     .map(Self::from)
             }
             DataType::Timestamp(TimeUnit::Microsecond, None) => {
                 let value = value.as_primitive::<TimestampMicrosecondType>().value(0);
                 DateTime::from_timestamp_micros(value)
-                    .ok_or_else(|| ArrowError::InvalidArgumentError(format!("Invalid microsecond: {}", value)))
-                    .map(|v|Self::from(v.naive_utc()))
+                    .ok_or_else(|| {
+                        ArrowError::InvalidArgumentError(format!("Invalid microsecond: {}", value))
+                    })
+                    .map(|v| Self::from(v.naive_utc()))
             }
             DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => {
                 let value = value.as_primitive::<TimestampNanosecondType>().value(0);
@@ -402,14 +419,38 @@ impl Variant {
             }
             DataType::Timestamp(TimeUnit::Nanosecond, None) => {
                 let value = value.as_primitive::<TimestampNanosecondType>().value(0);
-                Ok(Self::from(DateTime::from_timestamp_nanos(value).naive_utc()))
+                Ok(Self::from(
+                    DateTime::from_timestamp_nanos(value).naive_utc(),
+                ))
             }
-            _ => Err(ArrowError::InvalidArgumentError(format!("Invalid datatype: {:?}", data_type))),
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "Invalid datatype: {:?}",
+                data_type
+            ))),
         }
     }
 
+    /// Check if this variant is null.
     pub fn is_null(&self) -> bool {
         matches!(self, Self::Null)
+    }
+
+    /// Encode this variant into meta, value and typed value.
+    pub fn encode(
+        &self,
+        typed: Option<DataType>,
+    ) -> Result<(Vec<u8>, Vec<u8>, Option<ArrayRef>), ArrowError> {
+        let meta = MetaEncoder::encode(self)?;
+        let meta = VariantMetadata::try_new(Buffer::Bytes(Bytes::from(meta)))?;
+        let name_to_id = meta.name_to_index()?;
+
+        match typed {
+            Some(_) => todo!(),
+            None => {
+                let value = ValueEncoder::encode(&name_to_id, self)?;
+                Ok((vec![], value, None))
+            }
+        }
     }
 }
 
@@ -647,9 +688,7 @@ impl TryFrom<(i32, u8)> for Variant {
     type Error = ArrowError;
 
     fn try_from(value: (i32, u8)) -> Result<Self, Self::Error> {
-        Ok(Self::Decimal4(VariantDecimal4::try_new(
-            value.0, value.1,
-        )?))
+        Ok(Self::Decimal4(VariantDecimal4::try_new(value.0, value.1)?))
     }
 }
 
@@ -657,9 +696,7 @@ impl TryFrom<(i64, u8)> for Variant {
     type Error = ArrowError;
 
     fn try_from(value: (i64, u8)) -> Result<Self, Self::Error> {
-        Ok(Self::Decimal8(VariantDecimal8::try_new(
-            value.0, value.1,
-        )?))
+        Ok(Self::Decimal8(VariantDecimal8::try_new(value.0, value.1)?))
     }
 }
 

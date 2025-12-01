@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::sync::Arc;
-use arrow_array::{ArrayRef, StructArray};
-use arrow_array::cast::AsArray;
-use arrow_schema::ArrowError;
-use crate::DataTypeExt;
 use crate::variant::metadata::VariantMetadata;
-use crate::variant::utils::{first_byte_from_slice, overflow_error, slice_from_slice, try_binary_search_range_by};
+use crate::variant::utils::{
+    first_byte_from_slice, overflow_error, slice_from_slice, try_binary_search_range_by,
+};
 use crate::variant::value::{VariantObjectHeader, VariantValueHeader, VariantValueMeta};
 use crate::variant::{Buffer, Variant};
+use crate::DataTypeExt;
+use arrow_array::cast::AsArray;
+use arrow_array::{ArrayRef, StructArray};
+use arrow_schema::ArrowError;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum VariantObject {
@@ -25,6 +27,10 @@ impl VariantObject {
             Self::Encoded(encoded) => encoded.try_field_with_name(name),
             Self::Typed(typed) => typed.try_field_with_name(name),
         }
+    }
+
+    pub fn names(&self) -> Vec<String> {
+        todo!()
     }
 }
 
@@ -50,6 +56,7 @@ impl MergedVariantObject {
         };
 
         let typed = if let Some(typed_value) = &self.typed_value {
+            // TODO: should distinguish field name not exists and field is null.
             typed_value.try_field_with_name(name)?
         } else {
             Variant::Null
@@ -63,12 +70,13 @@ impl MergedVariantObject {
             Ok(typed)
         } else {
             let v = match (encoded, typed) {
-                (Variant::Object(VariantObject::Encoded(e)), Variant::Object(VariantObject::Typed(t))) => {
-                    Variant::Object(VariantObject::Merged(Self {
-                        encoded_value: Some(e),
-                        typed_value: Some(t),
-                    }))
-                }
+                (
+                    Variant::Object(VariantObject::Encoded(e)),
+                    Variant::Object(VariantObject::Typed(t)),
+                ) => Variant::Object(VariantObject::Merged(Self {
+                    encoded_value: Some(e),
+                    typed_value: Some(t),
+                })),
                 (_, t) => t,
             };
             Ok(v)
@@ -87,7 +95,11 @@ pub struct EncodedObject {
 }
 
 impl EncodedObject {
-    pub fn try_new(metadata: Arc<VariantMetadata>, header: Option<VariantObjectHeader>, value: Buffer) -> Result<Self, ArrowError> {
+    pub fn try_new(
+        metadata: Arc<VariantMetadata>,
+        header: Option<VariantObjectHeader>,
+        value: Buffer,
+    ) -> Result<Self, ArrowError> {
         let header = match header {
             Some(h) => h,
             None => {
@@ -95,16 +107,20 @@ impl EncodedObject {
                 let value_meta = VariantValueMeta::try_from(first_byte)?;
                 match value_meta.header {
                     VariantValueHeader::Object(header) => header,
-                    _ => return Err(ArrowError::InvalidArgumentError(format!("Variant value must be an object, but got {:?}", value_meta.header))),
+                    _ => {
+                        return Err(ArrowError::InvalidArgumentError(format!(
+                            "Variant value must be an object, but got {:?}",
+                            value_meta.header
+                        )))
+                    }
                 }
             }
         };
 
         // Determine num_elements size
-        let num_elements =
-            header
-                .num_elements_size
-                .unpack_u32_at_offset(&value, 1, 0)?;
+        let num_elements = header
+            .num_elements_size
+            .unpack_u32_at_offset(&value, 1, 0)?;
 
         // first_field_offset_byte = 1 + num_elements_size + field_id_size * num_elements
         let first_field_offset_byte = num_elements
@@ -131,40 +147,51 @@ impl EncodedObject {
 
     /// Get a field's value by name.
     pub fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
-        let cmp = |i| {
-            match self.try_field_name(i) {
-                Ok(f) => Some(f.cmp(name)),
-                Err(_) => None,
-            }
+        let cmp = |i| match self.try_field_name(i) {
+            Ok(f) => Some(f.cmp(name)),
+            Err(_) => None,
         };
 
         match try_binary_search_range_by(0..self.num_elements as usize, cmp) {
             Some(Ok(index)) => Ok(self.try_field_with_index(index)?),
-            _ => Err(ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))),
+            _ => Err(ArrowError::InvalidArgumentError(format!(
+                "Variant object field name {} not found",
+                name
+            ))),
         }
     }
 
     /// Get a field's value by index.
     fn try_field_with_index(&self, i: usize) -> Result<Variant, ArrowError> {
         if i < self.num_elements as usize {
-            let value_bytes = slice_from_slice(&self.value, self.first_value_byte as _..self.value.len())?;
-            let value_bytes = slice_from_slice(&value_bytes, self.get_offset(i)? as _..value_bytes.len())?;
+            let value_bytes =
+                slice_from_slice(&self.value, self.first_value_byte as _..self.value.len())?;
+            let value_bytes =
+                slice_from_slice(&value_bytes, self.get_offset(i)? as _..value_bytes.len())?;
             Variant::try_new_encoded(self.metadata.clone(), value_bytes)
         } else {
-            Err(ArrowError::InvalidArgumentError(format!("Variant object index {} out of bounds", i)))
+            Err(ArrowError::InvalidArgumentError(format!(
+                "Variant object index {} out of bounds",
+                i
+            )))
         }
     }
 
     // Returns field name by index
     fn try_field_name(&self, i: usize) -> Result<&str, ArrowError> {
         let field_id_bytes = self.field_id_bytes()?;
-        let field_id = self.header.field_id_size.unpack_u32_at_offset(&field_id_bytes, 0, i)?;
+        let field_id = self
+            .header
+            .field_id_size
+            .unpack_u32_at_offset(&field_id_bytes, 0, i)?;
         self.metadata.get_name(field_id as _)
     }
 
     // Attempts to retrieve the ith offset from the field offset region of the byte buffer.
     fn get_offset(&self, i: usize) -> Result<u32, ArrowError> {
-        self.header.field_offset_size.unpack_u32_at_offset(&self.field_offset_bytes()?, 0, i)
+        self.header
+            .field_offset_size
+            .unpack_u32_at_offset(&self.field_offset_bytes()?, 0, i)
     }
 
     // Returns field id bytes.
@@ -195,12 +222,17 @@ impl TypedObject {
         }
 
         let value = value.as_struct();
-        Ok(Self { value: value.clone() })
+        Ok(Self {
+            value: value.clone(),
+        })
     }
 
     pub fn try_field_with_name(&self, name: &str) -> Result<Variant, ArrowError> {
         let arr = self.value.column_by_name(name).ok_or_else(|| {
-            ArrowError::InvalidArgumentError(format!("Variant object field name {} not found", name))
+            ArrowError::InvalidArgumentError(format!(
+                "Variant object field name {} not found",
+                name
+            ))
         })?;
         Variant::try_new_typed(arr)
     }

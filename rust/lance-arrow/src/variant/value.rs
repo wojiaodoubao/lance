@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use arrow_schema::ArrowError;
 use crate::variant::metadata::OffsetSizeBytes;
 use crate::variant::object::EncodedObject;
+use arrow_schema::ArrowError;
 
 /// The basic type of [`Variant`] value. This is encoded in 2 bits, including: primitive, object
 /// and list.
@@ -22,9 +22,9 @@ impl TryFrom<u8> for VariantBasicType {
             0 => Ok(Self::Primitive),
             1 => Ok(Self::Object),
             2 => Ok(Self::List),
-            n => Err(ArrowError::InvalidArgumentError(
-                format!("Unsupported variant basic type: {n}"),
-            )),
+            n => Err(ArrowError::InvalidArgumentError(format!(
+                "Unsupported variant basic type: {n}"
+            ))),
         }
     }
 }
@@ -80,9 +80,9 @@ impl TryFrom<u8> for VariantPrimitiveType {
             18 => Ok(Self::TimestampNtzMicros),
             19 => Ok(Self::TimestampNanos),
             20 => Ok(Self::TimestampNtzNanos),
-            n => Err(ArrowError::InvalidArgumentError(
-                format!("Unsupported variant primitive type: {n}"),
-            )),
+            n => Err(ArrowError::InvalidArgumentError(format!(
+                "Unsupported variant primitive type: {n}"
+            ))),
         }
     }
 }
@@ -100,7 +100,7 @@ impl TryFrom<u8> for VariantObjectHeader {
 
     fn try_from(value: u8) -> Result<Self, Self::Error> {
         let field_offset_size = OffsetSizeBytes::try_new(value & 0x03)?; // Last 2 bits
-        let field_id_size = OffsetSizeBytes::try_new((value >> 2) & 0x03)?;; // Next 2 bits
+        let field_id_size = OffsetSizeBytes::try_new((value >> 2) & 0x03)?; // Next 2 bits
         let is_large = (value & 0x10) != 0; // 5th bit
         let num_elements_size = match is_large {
             true => OffsetSizeBytes::Four,
@@ -165,9 +165,13 @@ impl TryFrom<u8> for VariantValueMeta {
             VariantBasicType::Primitive => {
                 let primitive_type = VariantPrimitiveType::try_from(header_value)?;
                 VariantValueHeader::Primitive(primitive_type)
-            },
-            VariantBasicType::Object => VariantValueHeader::Object(VariantObjectHeader::try_from(header_value)?),
-            VariantBasicType::List => VariantValueHeader::List(VariantListHeader::try_from(header_value)?),
+            }
+            VariantBasicType::Object => {
+                VariantValueHeader::Object(VariantObjectHeader::try_from(header_value)?)
+            }
+            VariantBasicType::List => {
+                VariantValueHeader::List(VariantListHeader::try_from(header_value)?)
+            }
         };
         Ok(Self {
             raw_byte: value,
