@@ -187,6 +187,10 @@ fn check_field_conflict(
         (DataType::FixedSizeList(fl, _), DataType::FixedSizeList(fr, _)) => {
             check_field_conflict(fl, fr, version)
         }
+        (l_type, r_type) if l_type == r_type => Err(Error::invalid_input(
+            format!("Column {} already exists in the dataset", left.name()),
+            location!(),
+        )),
         (_, _) => Err(Error::invalid_input(
             format!(
                 "Type conflicts between {}({}) and {}({})",
