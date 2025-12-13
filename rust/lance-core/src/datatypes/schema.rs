@@ -403,30 +403,6 @@ impl Schema {
         })
     }
 
-    /// Exclude the fields from `other` Schema, and returns a new Schema.
-    pub fn exclude<T: TryInto<Self> + Debug>(&self, schema: T) -> Result<Self> {
-        let other = schema.try_into().map_err(|_| Error::Schema {
-            message: "The other schema is not compatible with this schema".to_string(),
-            location: location!(),
-        })?;
-        let mut fields = vec![];
-        for field in self.fields.iter() {
-            if let Some(other_field) = other.field(&field.name) {
-                if field.data_type().is_struct() {
-                    if let Some(f) = field.exclude(other_field) {
-                        fields.push(f)
-                    }
-                }
-            } else {
-                fields.push(field.clone());
-            }
-        }
-        Ok(Self {
-            fields,
-            metadata: self.metadata.clone(),
-        })
-    }
-
     /// Get a field by its path. Return `None` if the field does not exist.
     /// Field names containing dots must be quoted: parent."child.with.dot"
     pub fn field(&self, name: &str) -> Option<&Field> {
@@ -1967,41 +1943,6 @@ mod tests {
 
         let field = schema.field("b.f2").unwrap();
         assert_eq!(field.data_type(), DataType::Boolean);
-    }
-
-    #[test]
-    fn test_exclude_fields() {
-        let arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new("a", DataType::Int32, false),
-            ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![
-                    ArrowField::new("f1", DataType::Utf8, true),
-                    ArrowField::new("f2", DataType::Boolean, false),
-                    ArrowField::new("f3", DataType::Float32, false),
-                ])),
-                true,
-            ),
-            ArrowField::new("c", DataType::Float64, false),
-        ]);
-        let schema = Schema::try_from(&arrow_schema).unwrap();
-
-        let projection = schema.project(&["a", "b.f2", "b.f3"]).unwrap();
-        let excluded = schema.exclude(&projection).unwrap();
-
-        let expected_arrow_schema = ArrowSchema::new(vec![
-            ArrowField::new(
-                "b",
-                DataType::Struct(ArrowFields::from(vec![ArrowField::new(
-                    "f1",
-                    DataType::Utf8,
-                    true,
-                )])),
-                true,
-            ),
-            ArrowField::new("c", DataType::Float64, false),
-        ]);
-        assert_eq!(ArrowSchema::from(&excluded), expected_arrow_schema);
     }
 
     #[test]
