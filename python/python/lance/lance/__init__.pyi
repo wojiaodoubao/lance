@@ -61,6 +61,7 @@ from .fragment import (
     RowIdMeta as RowIdMeta,
 )
 from .indices import IndexDescription as IndexDescription
+from .lance import PySearchFilter
 from .optimize import (
     Compaction as Compaction,
 )
@@ -223,6 +224,7 @@ class _Dataset:
         columns: Optional[List[str]] = None,
         columns_with_transform: Optional[List[Tuple[str, str]]] = None,
         filter: Optional[str] = None,
+        search_filter: Optional[PySearchFilter] = None,
         prefilter: Optional[bool] = None,
         limit: Optional[int] = None,
         offset: Optional[int] = None,
