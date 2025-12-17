@@ -5,6 +5,7 @@ use jni::objects::{JIntArray, JLongArray, JMap, JObject, JString, JValue, JValue
 use jni::JNIEnv;
 
 use crate::error::Result;
+use crate::JNIEnvExt;
 
 pub trait FromJObject<T> {
     fn extract(&self) -> Result<T>;
