@@ -14,13 +14,9 @@ use jni::sys::{jboolean, jint, JNI_TRUE};
 use jni::{sys::jlong, JNIEnv};
 use lance::dataset::scanner::{ColumnOrdering, DatasetRecordBatchStream, Scanner};
 use lance_index::scalar::inverted::query::{
-    BooleanQuery as FtsBooleanQuery,
-    BoostQuery as FtsBoostQuery,
-    FtsQuery,
-    MatchQuery as FtsMatchQuery,
-    MultiMatchQuery as FtsMultiMatchQuery,
+    BooleanQuery as FtsBooleanQuery, BoostQuery as FtsBoostQuery, FtsQuery,
+    MatchQuery as FtsMatchQuery, MultiMatchQuery as FtsMultiMatchQuery, Occur as FtsOccur,
     PhraseQuery as FtsPhraseQuery,
-    Occur as FtsOccur,
 };
 use lance_index::scalar::FullTextSearchQuery;
 use lance_io::ffi::to_ffi_arrow_array_stream;
@@ -62,10 +58,7 @@ impl BlockingScanner {
     }
 }
 
-fn build_full_text_search_query<'a>(
-    env: &mut JNIEnv<'a>,
-    java_obj: JObject,
-) -> Result<FtsQuery> {
+fn build_full_text_search_query<'a>(env: &mut JNIEnv<'a>, java_obj: JObject) -> Result<FtsQuery> {
     let type_obj = env
         .call_method(
             &java_obj,
@@ -80,8 +73,7 @@ fn build_full_text_search_query<'a>(
         "MATCH" => {
             let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
             let column = env.get_string_from_method(&java_obj, "getColumn")?;
-            let boost = env
-                .get_f32_from_method(&java_obj, "getBoost")?;
+            let boost = env.get_f32_from_method(&java_obj, "getBoost")?;
             let fuzziness = env.get_optional_u32_from_method(&java_obj, "getFuzziness")?;
             let max_expansions = env.get_int_as_usize_from_method(&java_obj, "getMaxExpansions")?;
             let operator = env.get_fts_operator_from_method(&java_obj)?;
@@ -111,11 +103,12 @@ fn build_full_text_search_query<'a>(
         }
         "MULTI_MATCH" => {
             let query_text = env.get_string_from_method(&java_obj, "getQueryText")?;
-            let columns: Vec<String> = import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
-                let jstr = JString::from(elem);
-                let value: String = env.get_string(&jstr)?.into();
-                Ok(value)
-            })?;
+            let columns: Vec<String> =
+                import_vec_from_method(env, &java_obj, "getColumns", |env, elem| {
+                    let jstr = JString::from(elem);
+                    let value: String = env.get_string(&jstr)?.into();
+                    Ok(value)
+                })?;
 
             let boosts: Option<Vec<f32>> =
                 env.get_optional_from_method(&java_obj, "getBoosts", |env, list_obj| {
@@ -169,11 +162,8 @@ fn build_full_text_search_query<'a>(
             Ok(FtsQuery::Boost(query))
         }
         "BOOLEAN" => {
-            let clauses: Vec<(FtsOccur, FtsQuery)> = import_vec_from_method(
-                env,
-                &java_obj,
-                "getClauses",
-                |env, clause_obj| {
+            let clauses: Vec<(FtsOccur, FtsQuery)> =
+                import_vec_from_method(env, &java_obj, "getClauses", |env, clause_obj| {
                     let occur = env.get_occur_from_method(&clause_obj)?;
 
                     let query_obj = env
@@ -191,10 +181,9 @@ fn build_full_text_search_query<'a>(
                     }
                     let query = build_full_text_search_query(env, query_obj)?;
                     Ok((occur, query))
-                },
-            )?;
+                })?;
 
-            let boolean_query = FtsBooleanQuery::new(clauses.into_iter());
+            let boolean_query = FtsBooleanQuery::new(clauses);
             Ok(FtsQuery::Boolean(boolean_query))
         }
         other => Err(Error::input_error(format!(
