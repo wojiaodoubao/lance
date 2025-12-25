@@ -13,25 +13,19 @@
  */
 package org.lance.index.scalar;
 
-/**
- * Builder-style configuration for LabelList scalar index parameters.
- */
+/** Builder-style configuration for LabelList scalar index parameters. */
 public final class LabelListIndexParams {
   private static final String INDEX_TYPE = "labellist";
 
   private LabelListIndexParams() {}
 
-  /**
-   * Create a new builder for LabelList index parameters.
-   */
+  /** Create a new builder for LabelList index parameters. */
   public static Builder builder() {
     return new Builder();
   }
 
   public static final class Builder {
-    /**
-     * Build a {@link ScalarIndexParams} instance for a LabelList index.
-     */
+    /** Build a {@link ScalarIndexParams} instance for a LabelList index. */
     public ScalarIndexParams build() {
       return ScalarIndexParams.create(INDEX_TYPE);
     }

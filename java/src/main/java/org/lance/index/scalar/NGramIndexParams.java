@@ -13,25 +13,19 @@
  */
 package org.lance.index.scalar;
 
-/**
- * Builder-style configuration for NGram scalar index parameters.
- */
+/** Builder-style configuration for NGram scalar index parameters. */
 public final class NGramIndexParams {
   private static final String INDEX_TYPE = "ngram";
 
   private NGramIndexParams() {}
 
-  /**
-   * Create a new builder for NGram index parameters.
-   */
+  /** Create a new builder for NGram index parameters. */
   public static Builder builder() {
     return new Builder();
   }
 
   public static final class Builder {
-    /**
-     * Build a {@link ScalarIndexParams} instance for a NGram index.
-     */
+    /** Build a {@link ScalarIndexParams} instance for a NGram index. */
     public ScalarIndexParams build() {
       return ScalarIndexParams.create(INDEX_TYPE);
     }

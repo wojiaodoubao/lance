@@ -15,11 +15,8 @@ package org.lance.index.scalar;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.Objects;
 
-/**
- * Builder-style configuration for ZoneMap scalar index parameters.
- */
+/** Builder-style configuration for ZoneMap scalar index parameters. */
 public final class ZoneMapIndexParams {
 
   private static final String INDEX_TYPE = "zonemap";
@@ -54,9 +51,7 @@ public final class ZoneMapIndexParams {
       return this;
     }
 
-    /**
-     * Build a {@link ScalarIndexParams} instance for a ZoneMap index.
-     */
+    /** Build a {@link ScalarIndexParams} instance for a ZoneMap index. */
     public ScalarIndexParams build() {
       Map<String, Object> params = new LinkedHashMap<>();
       if (rowsPerZone != null) {

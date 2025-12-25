@@ -19,9 +19,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-/**
- * Builder-style configuration for inverted (full-text) scalar index parameters.
- */
+/** Builder-style configuration for inverted (full-text) scalar index parameters. */
 public final class InvertedIndexParams {
 
   private static final String INDEX_TYPE = "inverted";
@@ -223,8 +221,8 @@ public final class InvertedIndexParams {
 
     /**
      * Configure whether to skip the partition merge stage after indexing. If true, skip the
-     * partition merge stage after indexing. This can be useful for distributed indexing where
-     * merge is handled separately.
+     * partition merge stage after indexing. This can be useful for distributed indexing where merge
+     * is handled separately.
      *
      * @param skipMerge whether to skip partition merge
      * @return this builder
@@ -234,9 +232,7 @@ public final class InvertedIndexParams {
       return this;
     }
 
-    /**
-     * Build a {@link ScalarIndexParams} instance for an inverted index.
-     */
+    /** Build a {@link ScalarIndexParams} instance for an inverted index. */
     public ScalarIndexParams build() {
       Map<String, Object> params = new LinkedHashMap<>();
       if (baseTokenizer != null) {

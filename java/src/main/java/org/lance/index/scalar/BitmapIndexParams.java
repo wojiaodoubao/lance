@@ -13,25 +13,19 @@
  */
 package org.lance.index.scalar;
 
-/**
- * Builder-style configuration for Bitmap scalar index parameters.
- */
+/** Builder-style configuration for Bitmap scalar index parameters. */
 public final class BitmapIndexParams {
   private static final String INDEX_TYPE = "bitmap";
 
   private BitmapIndexParams() {}
 
-  /**
-   * Create a new builder for Bitmap index parameters.
-   */
+  /** Create a new builder for Bitmap index parameters. */
   public static Builder builder() {
     return new Builder();
   }
 
   public static final class Builder {
-    /**
-     * Build a {@link ScalarIndexParams} instance for a Bitmap index.
-     */
+    /** Build a {@link ScalarIndexParams} instance for a Bitmap index. */
     public ScalarIndexParams build() {
       return ScalarIndexParams.create(INDEX_TYPE);
     }

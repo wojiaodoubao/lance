@@ -16,9 +16,7 @@ package org.lance.index.scalar;
 import java.util.LinkedHashMap;
 import java.util.Map;
 
-/**
- * Builder-style configuration for B-Tree scalar index parameters.
- */
+/** Builder-style configuration for B-Tree scalar index parameters. */
 public final class BTreeIndexParams {
 
   private static final String INDEX_TYPE = "btree";
@@ -68,9 +66,7 @@ public final class BTreeIndexParams {
       return this;
     }
 
-    /**
-     * Build a {@link ScalarIndexParams} instance for a B-Tree index.
-     */
+    /** Build a {@link ScalarIndexParams} instance for a B-Tree index. */
     public ScalarIndexParams build() {
       Map<String, Object> params = new LinkedHashMap<>();
       if (zoneSize != null) {
