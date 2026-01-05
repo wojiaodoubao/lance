@@ -283,10 +283,12 @@ impl BlockingDataset {
         &mut self,
         transaction: Transaction,
         store_params: ObjectStoreParams,
+        detached: bool,
     ) -> Result<Self> {
         let new_dataset = RT.block_on(
             CommitBuilder::new(Arc::new(self.clone().inner))
                 .with_store_params(store_params)
+                .with_detached(detached)
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })

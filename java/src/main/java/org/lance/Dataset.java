@@ -450,9 +450,21 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to committed version.
    */
   public Dataset commitTransaction(Transaction transaction) {
+    return commitTransaction(transaction, false);
+  }
+
+  /**
+   * Commit a single transaction and return a new Dataset with the new version. Original dataset
+   * version will not be refreshed.
+   *
+   * @param transaction The transaction to commit
+   * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @return A new instance of {@link Dataset} linked to committed version.
+   */
+  public Dataset commitTransaction(Transaction transaction, boolean detached) {
     Preconditions.checkNotNull(transaction);
     try {
-      Dataset dataset = nativeCommitTransaction(transaction);
+      Dataset dataset = nativeCommitTransaction(transaction, detached);
       if (selfManagedAllocator) {
         dataset.allocator = new RootAllocator(Long.MAX_VALUE);
       } else {
@@ -464,7 +476,7 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native Dataset nativeCommitTransaction(Transaction transaction);
+  private native Dataset nativeCommitTransaction(Transaction transaction, boolean detached);
 
   /**
    * Drop a Dataset.
