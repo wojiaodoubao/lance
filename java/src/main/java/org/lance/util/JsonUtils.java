@@ -11,19 +11,19 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package org.lance.index.scalar;
+package org.lance.util;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.util.Map;
 
-final class JsonUtils {
+public final class JsonUtils {
   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
 
   private JsonUtils() {}
 
-  static String toJson(Map<String, Object> params) {
+  public static String toJson(Map<String, Object> params) {
     try {
       return OBJECT_MAPPER.writeValueAsString(params);
     } catch (JsonProcessingException e) {

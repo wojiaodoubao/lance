@@ -13,8 +13,12 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.util.JsonUtils;
+
+import com.google.common.base.Preconditions;
+
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -234,7 +238,7 @@ public final class InvertedIndexParams {
 
     /** Build a {@link ScalarIndexParams} instance for an inverted index. */
     public ScalarIndexParams build() {
-      Map<String, Object> params = new LinkedHashMap<>();
+      Map<String, Object> params = new HashMap<>();
       if (baseTokenizer != null) {
         params.put("base_tokenizer", baseTokenizer);
       }
@@ -266,6 +270,11 @@ public final class InvertedIndexParams {
         params.put("min_ngram_length", minNgramLength);
       }
       if (maxNgramLength != null) {
+        Preconditions.checkArgument(
+            minNgramLength == null || maxNgramLength >= minNgramLength,
+            "maxNgramLength {} shouldn't less than minNgramLength {}",
+            maxNgramLength,
+            minNgramLength);
         params.put("max_ngram_length", maxNgramLength);
       }
       if (prefixOnly != null) {

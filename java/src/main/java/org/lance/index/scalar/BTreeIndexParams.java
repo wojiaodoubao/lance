@@ -13,7 +13,9 @@
  */
 package org.lance.index.scalar;
 
-import java.util.LinkedHashMap;
+import org.lance.util.JsonUtils;
+
+import java.util.HashMap;
 import java.util.Map;
 
 /** Builder-style configuration for B-Tree scalar index parameters. */
@@ -68,7 +70,7 @@ public final class BTreeIndexParams {
 
     /** Build a {@link ScalarIndexParams} instance for a B-Tree index. */
     public ScalarIndexParams build() {
-      Map<String, Object> params = new LinkedHashMap<>();
+      Map<String, Object> params = new HashMap<>();
       if (zoneSize != null) {
         params.put("zone_size", zoneSize);
       }

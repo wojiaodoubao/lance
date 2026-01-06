@@ -13,7 +13,9 @@
  */
 package org.lance.index.scalar;
 
-import java.util.LinkedHashMap;
+import org.lance.util.JsonUtils;
+
+import java.util.HashMap;
 import java.util.Map;
 
 /** Builder-style configuration for ZoneMap scalar index parameters. */
@@ -34,7 +36,6 @@ public final class ZoneMapIndexParams {
 
   public static final class Builder {
     private Long rowsPerZone;
-    private final Map<String, Object> extraParams = new LinkedHashMap<>();
 
     /**
      * Configure the approximate number of rows per zone.
@@ -53,11 +54,10 @@ public final class ZoneMapIndexParams {
 
     /** Build a {@link ScalarIndexParams} instance for a ZoneMap index. */
     public ScalarIndexParams build() {
-      Map<String, Object> params = new LinkedHashMap<>();
+      Map<String, Object> params = new HashMap<>();
       if (rowsPerZone != null) {
         params.put("rows_per_zone", rowsPerZone);
       }
-      params.putAll(extraParams);
 
       String json = JsonUtils.toJson(params);
       return ScalarIndexParams.create(INDEX_TYPE, json);
