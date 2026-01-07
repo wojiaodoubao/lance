@@ -175,7 +175,7 @@ impl BlockingDataset {
             }),
             None,
             Default::default(),
-            false, // TODO: support enable_v2_manifest_paths
+            false,
         ))?;
         Ok(Self { inner })
     }
@@ -284,11 +284,13 @@ impl BlockingDataset {
         transaction: Transaction,
         store_params: ObjectStoreParams,
         detached: bool,
+        enable_v2_manifest_paths: bool,
     ) -> Result<Self> {
         let new_dataset = RT.block_on(
             CommitBuilder::new(Arc::new(self.clone().inner))
                 .with_store_params(store_params)
                 .with_detached(detached)
+                .enable_v2_manifest_paths(enable_v2_manifest_paths)
                 .execute(transaction),
         )?;
         Ok(BlockingDataset { inner: new_dataset })

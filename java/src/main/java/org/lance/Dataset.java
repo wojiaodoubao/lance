@@ -455,7 +455,7 @@ public class Dataset implements Closeable {
    * @return A new instance of {@link Dataset} linked to committed version.
    */
   public Dataset commitTransaction(Transaction transaction) {
-    return commitTransaction(transaction, false);
+    return commitTransaction(transaction, false, true);
   }
 
   /**
@@ -464,12 +464,14 @@ public class Dataset implements Closeable {
    *
    * @param transaction The transaction to commit
    * @param detached If true, the commit will not be part of the main dataset lineage.
+   * @param enableV2ManifestPaths If true, use v2 manifest, default is true.
    * @return A new instance of {@link Dataset} linked to committed version.
    */
-  public Dataset commitTransaction(Transaction transaction, boolean detached) {
+  public Dataset commitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths) {
     Preconditions.checkNotNull(transaction);
     try {
-      Dataset dataset = nativeCommitTransaction(transaction, detached);
+      Dataset dataset = nativeCommitTransaction(transaction, detached, enableV2ManifestPaths);
       if (selfManagedAllocator) {
         dataset.allocator = new RootAllocator(Long.MAX_VALUE);
       } else {
@@ -481,7 +483,8 @@ public class Dataset implements Closeable {
     }
   }
 
-  private native Dataset nativeCommitTransaction(Transaction transaction, boolean detached);
+  private native Dataset nativeCommitTransaction(
+      Transaction transaction, boolean detached, boolean enableV2ManifestPaths);
 
   /**
    * Drop a Dataset.
