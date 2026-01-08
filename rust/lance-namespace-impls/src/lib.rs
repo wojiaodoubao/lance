@@ -77,6 +77,8 @@ pub mod rest;
 
 #[cfg(feature = "rest-adapter")]
 pub mod rest_adapter;
+pub mod partition;
+pub mod json;
 
 // Re-export connect builder
 pub use connect::ConnectBuilder;

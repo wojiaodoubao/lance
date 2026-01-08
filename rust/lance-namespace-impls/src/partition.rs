@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 #![allow(unused)]
 
-use crate::dir::json::JsonPartitionField;
+use crate::json::JsonPartitionField;
 use crate::DirectoryNamespace;
 use arrow::array::RecordBatch;
 use arrow_schema::DataType;

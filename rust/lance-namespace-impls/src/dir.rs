@@ -6,9 +6,7 @@
 //! This module provides a directory-based implementation of the Lance namespace
 //! that stores tables as Lance datasets in a filesystem directory structure.
 
-pub mod json;
 pub mod manifest;
-pub mod partition;
 
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;

@@ -4,6 +4,7 @@
 use lance_namespace::models::JsonArrowDataType;
 use serde::{Deserialize, Serialize};
 
+// TODO: remove this after https://github.com/lance-format/lance-namespace/pull/297 is merged
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonPartitionField {
     field_id: String,
