@@ -176,6 +176,7 @@ impl BlockingDataset {
             None,
             Default::default(),
             false, // TODO: support enable_v2_manifest_paths
+            false, // serial_commit
         ))?;
         Ok(Self { inner })
     }

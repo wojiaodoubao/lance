@@ -674,6 +674,7 @@ async fn test_datafile_replacement() {
         None,
         Arc::new(Default::default()),
         false,
+        false,
     )
     .await
     .unwrap();
@@ -702,6 +703,7 @@ async fn test_datafile_replacement() {
         None,
         None,
         Arc::new(Default::default()),
+        false,
         false,
     )
     .await
@@ -756,6 +758,7 @@ async fn test_datafile_replacement() {
         None,
         None,
         Arc::new(Default::default()),
+        false,
         false,
     )
     .await
@@ -820,6 +823,7 @@ async fn test_datafile_partial_replacement() {
         None,
         Arc::new(Default::default()),
         false,
+        false,
     )
     .await
     .unwrap();
@@ -872,6 +876,7 @@ async fn test_datafile_partial_replacement() {
         None,
         None,
         Arc::new(Default::default()),
+        false,
         false,
     )
     .await
@@ -927,6 +932,7 @@ async fn test_datafile_partial_replacement() {
         None,
         None,
         Arc::new(Default::default()),
+        false,
         false,
     )
     .await
@@ -1000,6 +1006,7 @@ async fn test_datafile_replacement_error() {
         None,
         Arc::new(Default::default()),
         false,
+        false,
     )
     .await
     .unwrap();
@@ -1031,6 +1038,7 @@ async fn test_datafile_replacement_error() {
         None,
         None,
         Arc::new(Default::default()),
+        false,
         false,
     )
     .await

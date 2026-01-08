@@ -1113,6 +1113,9 @@ impl Debug for ConditionalPutCommitHandler {
 pub struct CommitConfig {
     pub num_retries: u32,
     pub skip_auto_cleanup: bool,
+    /// When true, fail immediately if any concurrent transactions have been committed
+    /// since the read version of the transaction being committed.
+    pub serial_commit: bool,
     // TODO: add isolation_level
 }
 
@@ -1121,6 +1124,7 @@ impl Default for CommitConfig {
         Self {
             num_retries: 20,
             skip_auto_cleanup: false,
+            serial_commit: false,
         }
     }
 }

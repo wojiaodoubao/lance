@@ -828,6 +828,18 @@ pub(crate) async fn commit_transaction(
         if !strict_overwrite {
             (dataset, other_transactions) = load_and_sort_new_transactions(&dataset).await?;
 
+            // In serial commit mode, we fail immediately if any concurrent transactions have been
+            // committed since the read version of the transaction being committed.
+            if commit_config.serial_commit && !other_transactions.is_empty() {
+                return Err(Error::CommitConflict {
+                    version: target_version,
+                    source:
+                        "Concurrent updates detected since read_version with serial_commit enabled"
+                            .into(),
+                    location: location!(),
+                });
+            }
+
             // See if we can retry the commit. Try to account for all
             // transactions that have been committed since the read_version.
             // Use small amount of backoff to handle transactions that all

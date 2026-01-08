@@ -124,6 +124,7 @@ impl TestDatasetGenerator {
             None,
             Default::default(),
             false,
+            false,
         )
         .await
         .unwrap()

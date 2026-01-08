@@ -116,6 +116,7 @@ async fn test_v2_manifest_path_commit() {
         None,
         Default::default(),
         true, // enable_v2_manifest_paths
+        false,
     )
     .await
     .unwrap();

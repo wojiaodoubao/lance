@@ -2868,6 +2868,7 @@ mod tests {
             None,
             Default::default(),
             true,
+            false,
         )
         .await
         .unwrap();
@@ -2941,6 +2942,7 @@ mod tests {
             None,
             Default::default(),
             true,
+            false,
         )
         .await
         .unwrap();
@@ -3400,10 +3402,18 @@ mod tests {
             initial_bases: None,
         };
 
-        let new_dataset =
-            Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
-                .await
-                .unwrap();
+        let new_dataset = Dataset::commit(
+            test_uri,
+            op,
+            None,
+            None,
+            None,
+            Default::default(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(new_dataset.count_rows(None).await.unwrap(), dataset_rows);
 
@@ -3510,10 +3520,18 @@ mod tests {
                 initial_bases: None,
             };
 
-            let dataset =
-                Dataset::commit(test_uri, op, None, None, None, Default::default(), false)
-                    .await
-                    .unwrap();
+            let dataset = Dataset::commit(
+                test_uri,
+                op,
+                None,
+                None,
+                None,
+                Default::default(),
+                false,
+                false,
+            )
+            .await
+            .unwrap();
 
             // We only kept the first fragment of 40 rows
             assert_eq!(
@@ -3750,6 +3768,7 @@ mod tests {
             None,
             Default::default(),
             false,
+            false,
         )
         .await?;
 
@@ -3884,6 +3903,7 @@ mod tests {
             None,
             None,
             Default::default(),
+            false,
             false,
         )
         .await

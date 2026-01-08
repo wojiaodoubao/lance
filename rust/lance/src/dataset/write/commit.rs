@@ -163,6 +163,13 @@ impl<'a> CommitBuilder<'a> {
         self
     }
 
+    /// When enabled, fail the commit if any transactions have been committed since
+    /// the transaction's read version. This enforces strict serial ordering.
+    pub fn with_serial_commit(mut self, serial_commit: bool) -> Self {
+        self.commit_config.serial_commit = serial_commit;
+        self
+    }
+
     /// Provide the set of row addresses that were deleted or updated. This is
     /// used to perform fast conflict resolution.
     pub fn with_affected_rows(mut self, affected_rows: RowAddrTreeMap) -> Self {
@@ -723,6 +730,54 @@ mod tests {
             assert_io_lt!(io_stats, num_stages, 6);
         }
         assert_io_eq!(io_stats, write_iops, 2); // txn + manifest
+    }
+
+    #[tokio::test]
+    async fn test_serial_commit() {
+        // Create a dataset with a single committed version.
+        let session = Arc::new(Session::default());
+        let write_params = WriteParams {
+            session: Some(session.clone()),
+            ..Default::default()
+        };
+        let data = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "a",
+                DataType::Int32,
+                false,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![0; 5]))],
+        )
+        .unwrap();
+        let dataset = InsertBuilder::new("memory://force_fail_any_update")
+            .with_params(&write_params)
+            .execute(vec![data])
+            .await
+            .unwrap();
+        let dataset = Arc::new(dataset);
+        let base_read_version = dataset.manifest().version;
+        assert_eq!(base_read_version, 1);
+
+        // Advance the dataset to version 2 using the same read_version.
+        let _ = CommitBuilder::new(dataset.clone())
+            .execute(sample_transaction(base_read_version))
+            .await
+            .unwrap();
+
+        // Attempt to commit again using the stale read_version and serial_commit.
+        let result = CommitBuilder::new(dataset.clone())
+            .with_serial_commit(true)
+            .execute(sample_transaction(base_read_version))
+            .await;
+
+        assert!(matches!(result, Err(Error::CommitConflict { .. })));
+
+        // Successfully commit using the same read_version and non serial_isolation.
+        CommitBuilder::new(dataset.clone())
+            .with_serial_commit(false)
+            .execute(sample_transaction(base_read_version))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

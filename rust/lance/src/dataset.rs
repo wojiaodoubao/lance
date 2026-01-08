@@ -1259,6 +1259,7 @@ impl Dataset {
         commit_handler: Option<Arc<dyn CommitHandler>>,
         session: Arc<Session>,
         enable_v2_manifest_paths: bool,
+        serial_commit: bool,
         detached: bool,
     ) -> Result<Self> {
         let read_version = read_version.map_or_else(
@@ -1277,7 +1278,8 @@ impl Dataset {
         let mut builder = CommitBuilder::new(base_uri)
             .enable_v2_manifest_paths(enable_v2_manifest_paths)
             .with_session(session)
-            .with_detached(detached);
+            .with_detached(detached)
+            .with_serial_commit(serial_commit);
 
         if let Some(store_params) = store_params {
             builder = builder.with_store_params(store_params);
@@ -1324,6 +1326,10 @@ impl Dataset {
     ///   dataset, use the [`Self::migrate_manifest_paths_v2`] method. WARNING: turning
     ///   this on will make the dataset unreadable for older versions of Lance
     ///   (prior to 0.17.0). Default is False.
+    /// * `serial_commit` - When true, the commit will fail if any transactions
+    ///   have been committed since `read_version`, enforcing strict serial ordering. When
+    ///   false (the default), the commit may be automatically rebased on concurrent updates.
+    #[allow(clippy::too_many_arguments)]
     pub async fn commit(
         dest: impl Into<WriteDestination<'_>>,
         operation: Operation,
@@ -1332,6 +1338,7 @@ impl Dataset {
         commit_handler: Option<Arc<dyn CommitHandler>>,
         session: Arc<Session>,
         enable_v2_manifest_paths: bool,
+        serial_commit: bool,
     ) -> Result<Self> {
         Self::do_commit(
             dest.into(),
@@ -1341,6 +1348,7 @@ impl Dataset {
             commit_handler,
             session,
             enable_v2_manifest_paths,
+            serial_commit,
             /*detached=*/ false,
         )
         .await
@@ -1371,6 +1379,7 @@ impl Dataset {
             commit_handler,
             session,
             enable_v2_manifest_paths,
+            /*serial_commit=*/ false,
             /*detached=*/ true,
         )
         .await
