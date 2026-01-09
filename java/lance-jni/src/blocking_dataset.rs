@@ -415,6 +415,24 @@ pub extern "system" fn Java_org_lance_Dataset_drop<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeMigrateManifestPathsV2(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) {
+    ok_or_throw_without_return!(
+        env,
+        inner_native_migrate_manifest_paths_v2(&mut env, java_dataset)
+    )
+}
+
+fn inner_native_migrate_manifest_paths_v2(env: &mut JNIEnv, java_dataset: JObject) -> Result<()> {
+    let mut dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    RT.block_on(dataset_guard.inner.migrate_manifest_paths_v2())?;
+    Ok(())
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_lance_Dataset_createWithFfiStream<'local>(
     mut env: JNIEnv<'local>,
     _obj: JObject,

@@ -464,7 +464,11 @@ public class Dataset implements Closeable {
    *
    * @param transaction The transaction to commit
    * @param detached If true, the commit will not be part of the main dataset lineage.
-   * @param enableV2ManifestPaths If true, use v2 manifest, default is true.
+   * @param enableV2ManifestPaths If true, and this is a new dataset, uses the new V2 manifest
+   *     paths. These paths provide more efficient opening of datasets with many versions on object
+   *     stores. This parameter has no effect if the dataset already exists. To migrate an existing
+   *     dataset, instead use the `migrateManifestPathsV2` method. Default is true. WARNING: turning
+   *     this on will make the dataset unreadable for older versions of Lance (prior to 0.17.0).
    * @return A new instance of {@link Dataset} linked to committed version.
    */
   public Dataset commitTransaction(
@@ -493,6 +497,26 @@ public class Dataset implements Closeable {
    * @param storageOptions Storage options
    */
   public static native void drop(String path, Map<String, String> storageOptions);
+
+  /**
+   * Migrate the manifest paths to the new format.
+   *
+   * <p>This will update the manifest to use the new v2 format for paths.
+   *
+   * <p>This function is idempotent, and can be run multiple times without changing the state of the
+   * object store.
+   *
+   * <p>DANGER: this should not be run while other concurrent operations are happening. And it
+   * should also run until completion before resuming other operations.
+   */
+  public void migrateManifestPathsV2() {
+    try (LockManager.WriteLock writeLock = lockManager.acquireWriteLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      nativeMigrateManifestPathsV2();
+    }
+  }
+
+  private native void nativeMigrateManifestPathsV2();
 
   /**
    * Add columns to the dataset.
