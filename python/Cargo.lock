@@ -4290,6 +4290,7 @@ dependencies = [
  "chrono",
  "futures",
  "lance",
+ "lance-arrow",
  "lance-core",
  "lance-index",
  "lance-io",
