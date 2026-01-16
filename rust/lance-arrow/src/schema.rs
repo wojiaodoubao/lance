@@ -4,8 +4,11 @@
 //! Extension to arrow schema
 
 use arrow_schema::{ArrowError, DataType, Field, FieldRef, Schema};
+use std::cmp::max;
 
 use crate::{ARROW_EXT_NAME_KEY, BLOB_META_KEY, BLOB_V2_EXT_NAME};
+
+pub const LANCE_FIELD_ID_META_KEY: &str = "lance:field_id";
 
 pub enum Indentation {
     OneLine,
@@ -43,6 +46,18 @@ pub trait FieldExt {
 
     /// Check if the field is marked as a blob
     fn is_blob_v2(&self) -> bool;
+
+    /// Get path and field with the input id
+    fn path_and_field_by_id(
+        &self,
+        id: i32,
+        prefix: &str,
+    ) -> Result<Option<(String, Field)>, ArrowError>;
+
+    /// Get the max field id of itself and all children.
+    ///
+    /// If `ignore_id_not_found` is true, ignore field without id. Otherwise, return error.
+    fn max_id(&self, ignore_id_not_found: bool) -> Result<Option<i32>, ArrowError>;
 }
 
 impl FieldExt for Field {
@@ -119,6 +134,103 @@ impl FieldExt for Field {
             .map(|value| value == BLOB_V2_EXT_NAME)
             .unwrap_or(false)
     }
+
+    fn path_and_field_by_id(
+        &self,
+        id: i32,
+        prefix: &str,
+    ) -> Result<Option<(String, Field)>, ArrowError> {
+        let path = if prefix.is_empty() {
+            self.name().to_string()
+        } else {
+            format!("{}.{}", prefix, self.name())
+        };
+
+        // find current field id
+        if let Some(id_str) = self.metadata().get(LANCE_FIELD_ID_META_KEY) {
+            let field_id: i32 = id_str.parse().map_err(|e| {
+                ArrowError::CastError(format!(
+                    "Invalid {} metadata value '{}' for field '{}': {}",
+                    LANCE_FIELD_ID_META_KEY,
+                    id_str,
+                    self.name(),
+                    e
+                ))
+            })?;
+
+            if id == field_id {
+                return Ok(Some((path, self.clone())));
+            }
+        };
+
+        // find in children.
+        match self.data_type() {
+            DataType::Struct(fields) => {
+                for child in fields.iter() {
+                    let v = child.path_and_field_by_id(id, &path)?;
+                    if v.is_some() {
+                        return Ok(v);
+                    }
+                }
+            }
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _) => {
+                return child.path_and_field_by_id(id, &path);
+            }
+            DataType::Map(child, _) => {
+                return child.path_and_field_by_id(id, &path);
+            }
+            _ => {}
+        }
+
+        Ok(None)
+    }
+
+    fn max_id(&self, ignore_id_not_found: bool) -> Result<Option<i32>, ArrowError> {
+        let id = match self.metadata().get(LANCE_FIELD_ID_META_KEY) {
+            Some(id_str) => id_str.parse::<i32>().ok(),
+            None => None,
+        };
+
+        if id.is_none() && !ignore_id_not_found {
+            return Err(ArrowError::CastError(format!(
+                "Invalid {} metadata value or value not fount for field '{}'",
+                LANCE_FIELD_ID_META_KEY,
+                self.name(),
+            )));
+        }
+
+        let mut max_id = id.unwrap_or(-1);
+        match self.data_type() {
+            DataType::Struct(fields) => {
+                for child in fields.iter() {
+                    if let Some(child_max_id) = child.max_id(ignore_id_not_found)? {
+                        max_id = max(max_id, child_max_id);
+                    }
+                }
+            }
+            DataType::List(child)
+            | DataType::LargeList(child)
+            | DataType::FixedSizeList(child, _) => {
+                if let Some(child_max_id) = child.max_id(ignore_id_not_found)? {
+                    max_id = max(max_id, child_max_id);
+                }
+            }
+            DataType::Map(child, _) => {
+                if let Some(child_max_id) = child.max_id(ignore_id_not_found)? {
+                    max_id = max(max_id, child_max_id);
+                }
+            }
+            _ => {}
+        }
+
+        if max_id == -1 {
+            Ok(None)
+        } else {
+            Ok(Some(max_id))
+        }
+    }
 }
 
 /// Extends the functionality of [arrow_schema::Schema].
@@ -140,6 +252,14 @@ pub trait SchemaExt {
     ///
     /// This is intended for display purposes and not for serialization
     fn to_compact_string(&self, indent: Indentation) -> String;
+
+    /// Get path and field with the input id
+    fn path_and_field_by_id(&self, id: i32) -> Result<Option<(String, Field)>, ArrowError>;
+
+    /// Get the max field id.
+    ///
+    /// If `ignore_id_not_found` is true, ignore field without id. Otherwise, return error.
+    fn max_id(&self, ignore_id_not_found: bool) -> Result<Option<i32>, ArrowError>;
 }
 
 impl SchemaExt for Schema {
@@ -203,5 +323,30 @@ impl SchemaExt for Schema {
         }
         result += "}";
         result
+    }
+
+    fn path_and_field_by_id(&self, id: i32) -> Result<Option<(String, Field)>, ArrowError> {
+        for f in self.fields().iter() {
+            let v = f.path_and_field_by_id(id, "")?;
+            if v.is_some() {
+                return Ok(v);
+            }
+        }
+        Ok(None)
+    }
+
+    fn max_id(&self, ignore_id_not_found: bool) -> Result<Option<i32>, ArrowError> {
+        let mut max_id = -1;
+        for f in self.fields().iter() {
+            let max_field_id = f.max_id(ignore_id_not_found)?;
+            if let Some(max_field_id) = max_field_id {
+                max_id = max(max_id, max_field_id);
+            }
+        }
+        if max_id == -1 {
+            Ok(None)
+        } else {
+            Ok(Some(max_id))
+        }
     }
 }

@@ -47,7 +47,7 @@ fn arrow_field_to_json(arrow_field: &Field) -> Result<JsonArrowField> {
 }
 
 /// Convert Arrow DataType to JsonArrowDataType
-fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
+pub fn arrow_type_to_json(data_type: &DataType) -> Result<JsonArrowDataType> {
     match data_type {
         // Primitive types
         DataType::Null => Ok(JsonArrowDataType::new("null".to_string())),
@@ -261,10 +261,15 @@ pub fn convert_json_arrow_type(json_type: &JsonArrowDataType) -> Result<DataType
         "uint32" => Ok(DataType::UInt32),
         "int64" => Ok(DataType::Int64),
         "uint64" => Ok(DataType::UInt64),
+        "float16" => Ok(DataType::Float16),
         "float32" => Ok(DataType::Float32),
         "float64" => Ok(DataType::Float64),
+        "date32" => Ok(DataType::Date32),
+        "date64" => Ok(DataType::Date64),
         "utf8" => Ok(DataType::Utf8),
+        "large_utf8" => Ok(DataType::LargeUtf8),
         "binary" => Ok(DataType::Binary),
+        "large_binary" => Ok(DataType::LargeBinary),
         _ => Err(Error::namespace(format!(
             "Unsupported Arrow type: {}",
             type_name

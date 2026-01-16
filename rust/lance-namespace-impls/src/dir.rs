@@ -8,6 +8,7 @@
 
 pub mod manifest;
 
+use crate::context::DynamicContextProvider;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -24,7 +25,6 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, CreateTableVersionRequest,
@@ -41,6 +41,7 @@ use lance_core::{Error, Result, box_error};
 use lance_namespace::LanceNamespace;
 use lance_namespace::schema::arrow_schema_to_json;
 
+use crate::ManifestNamespace;
 use crate::credentials::{
     CredentialVendor, create_credential_vendor_for_location, has_credential_vendor_config,
 };
@@ -599,6 +600,13 @@ impl std::fmt::Display for DirectoryNamespace {
 }
 
 impl DirectoryNamespace {
+    pub fn manifest_namespace(&self) -> Result<Arc<ManifestNamespace>> {
+        match self.manifest_ns {
+            Some(ref ns) => Ok(ns.clone()),
+            None => Err(Error::namespace("Not manifest namespace")),
+        }
+    }
+
     /// Apply pagination to a list of table names
     ///
     /// Sorts the list alphabetically and applies pagination using page_token (start_after) and limit.
