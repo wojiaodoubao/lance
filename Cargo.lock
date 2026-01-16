@@ -5203,6 +5203,7 @@ dependencies = [
  "futures",
  "google-cloud-auth",
  "lance",
+ "lance-arrow",
  "lance-core",
  "lance-index",
  "lance-io",
