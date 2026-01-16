@@ -7,21 +7,17 @@
 //! that stores tables as Lance datasets in a filesystem directory structure.
 
 pub mod manifest;
+pub mod manifest_ext;
 
+use crate::context::DynamicContextProvider;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
 use bytes::Bytes;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
+use lance_core::{box_error, Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::sync::Arc;
-
-use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
@@ -30,14 +26,19 @@ use lance_namespace::models::{
     DropTableRequest, DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
     ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
 };
-
-use lance_core::{box_error, Error, Result};
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
+use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
+use snafu::location;
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
 
 use crate::credentials::{
     create_credential_vendor_for_location, has_credential_vendor_config, CredentialVendor,
 };
+use crate::ManifestNamespace;
 
 /// Result of checking table status atomically.
 ///
@@ -552,6 +553,16 @@ impl std::fmt::Display for DirectoryNamespace {
 }
 
 impl DirectoryNamespace {
+    pub fn manifest_namespace(&self) -> Result<Arc<ManifestNamespace>> {
+        match self.manifest_ns {
+            Some(ref ns) => Ok(ns.clone()),
+            None => Err(Error::Namespace {
+                source: "Not manifest namespace".into(),
+                location: location!(),
+            }),
+        }
+    }
+
     /// Apply pagination to a list of table names
     ///
     /// Sorts the list alphabetically and applies pagination using page_token (start_after) and limit.

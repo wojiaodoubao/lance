@@ -13,8 +13,8 @@ rust-version.workspace = true
 
 [features]
 default = ["dir-aws", "dir-azure", "dir-gcp", "dir-oss", "dir-huggingface"]
-rest = ["dep:reqwest", "dep:serde"]
-rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http", "dep:serde"]
+rest = ["dep:reqwest"]
+rest-adapter = ["dep:axum", "dep:tower", "dep:tower-http"]
 # Cloud storage features for directory implementation - align with lance-io
 dir-gcp = ["lance-io/gcp", "lance/gcp"]
 dir-aws = ["lance-io/aws", "lance/aws"]
@@ -23,12 +23,15 @@ dir-oss = ["lance-io/oss", "lance/oss"]
 dir-huggingface = ["lance-io/huggingface", "lance/huggingface"]
 # Credential vending features
 credential-vendor-aws = ["dep:aws-sdk-sts", "dep:aws-config", "dep:aws-credential-types", "dep:sha2", "dep:base64"]
-credential-vendor-gcp = ["dep:google-cloud-auth", "dep:reqwest", "dep:serde", "dep:sha2", "dep:base64"]
+credential-vendor-gcp = ["dep:google-cloud-auth", "dep:reqwest", "dep:sha2", "dep:base64"]
 credential-vendor-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_storage", "dep:azure_storage_blobs", "dep:time", "dep:sha2", "dep:base64", "dep:reqwest"]
 
 [dependencies]
 lance-namespace.workspace = true
 lance-core.workspace = true
+lance-namespace-reqwest-client.workspace = true
+murmur3 = "0.5"
+datafusion-functions.workspace = true
 
 # REST implementation dependencies (optional, enabled by "rest" feature)
 reqwest = { version = "0.12", optional = true, default-features = false, features = [
@@ -53,7 +56,7 @@ arrow-schema = { workspace = true }
 axum = { workspace = true, optional = true }
 tower = { workspace = true, optional = true }
 tower-http = { workspace = true, optional = true, features = ["trace", "cors", "normalize-path"] }
-serde = { workspace = true, optional = true }
+serde = { workspace = true }
 
 # Common dependencies
 async-trait.workspace = true
@@ -82,6 +85,7 @@ azure_identity = { version = "0.21", optional = true }
 azure_storage = { version = "0.21", optional = true }
 azure_storage_blobs = { version = "0.21", optional = true }
 time = { version = "0.3", optional = true }
+lance-arrow = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

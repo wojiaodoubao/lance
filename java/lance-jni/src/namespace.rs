@@ -4,19 +4,27 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::datatypes::Schema as ArrowSchema;
 use bytes::Bytes;
 use jni::objects::{GlobalRef, JByteArray, JMap, JObject, JString, JValue};
 use jni::sys::{jbyteArray, jlong, jstring};
 use jni::JNIEnv;
 use lance_namespace::models::*;
 use lance_namespace::LanceNamespace as LanceNamespaceTrait;
+use lance_namespace_impls::partition::{
+    PartitionField, PartitionTable, PartitionedNamespace, PartitionedNamespaceBuilder,
+};
 use lance_namespace_impls::{
     ConnectBuilder, DirectoryNamespace, DirectoryNamespaceBuilder, DynamicContextProvider,
     OperationInfo, RestAdapter, RestAdapterConfig, RestNamespace, RestNamespaceBuilder,
 };
+use lance_namespace_reqwest_client::models::{
+    PartitionField as JsonPartitionField, PartitionSpec as JsonPartitionSpec,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
+use crate::traits::IntoJava;
 use crate::utils::to_rust_map;
 use crate::RT;
 
@@ -124,6 +132,31 @@ pub struct BlockingDirectoryNamespace {
 /// Blocking wrapper for RestNamespace
 pub struct BlockingRestNamespace {
     pub(crate) inner: RestNamespace,
+}
+
+/// Blocking wrapper for PartitionedNamespace
+pub struct BlockingPartitionedNamespace {
+    pub(crate) inner: PartitionedNamespace,
+}
+
+#[derive(Debug, Serialize)]
+struct JavaPartitionTable {
+    id: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    read_version: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct JavaPlanScanItem {
+    table: JavaPartitionTable,
+    refine_expr: String,
+}
+
+fn to_java_partition_table(t: &PartitionTable) -> JavaPartitionTable {
+    JavaPartitionTable {
+        id: t.id.clone(),
+        read_version: t.read_version,
+    }
 }
 
 // ============================================================================
@@ -1290,6 +1323,121 @@ fn call_namespace_query_method<'local>(
     Ok(byte_array)
 }
 
+/// Helper function to call namespace methods that return a response object (PartitionedNamespace)
+fn call_partitioned_namespace_method<'local, Req, Resp, F>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    request_json: JString,
+    f: F,
+) -> Result<JString<'local>>
+where
+    Req: for<'de> Deserialize<'de>,
+    Resp: Serialize,
+    F: FnOnce(&BlockingPartitionedNamespace, Req) -> lance_core::Result<Resp>,
+{
+    let namespace = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: Req = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    let response = f(namespace, request)
+        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))?;
+
+    env.new_string(response_json).map_err(Into::into)
+}
+
+/// Helper function for void methods (PartitionedNamespace)
+fn call_partitioned_namespace_void_method<Req, F>(
+    env: &mut JNIEnv,
+    handle: jlong,
+    request_json: JString,
+    f: F,
+) -> Result<()>
+where
+    Req: for<'de> Deserialize<'de>,
+    F: FnOnce(&BlockingPartitionedNamespace, Req) -> lance_core::Result<()>,
+{
+    let namespace = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: Req = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    f(namespace, request)
+        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+
+    Ok(())
+}
+
+/// Helper function for count methods (PartitionedNamespace)
+fn call_partitioned_namespace_count_method(
+    env: &mut JNIEnv,
+    handle: jlong,
+    request_json: JString,
+) -> Result<jlong> {
+    let namespace = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: CountTableRowsRequest = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    let count = RT
+        .block_on(namespace.inner.count_table_rows(request))
+        .map_err(|e| Error::runtime_error(format!("Count table rows failed: {}", e)))?;
+
+    Ok(count)
+}
+
+/// Helper function for methods with data parameter (PartitionedNamespace)
+fn call_partitioned_namespace_with_data_method<'local, Req, Resp, F>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    request_json: JString,
+    request_data: JByteArray,
+    f: F,
+) -> Result<JString<'local>>
+where
+    Req: for<'de> Deserialize<'de>,
+    Resp: Serialize,
+    F: FnOnce(&BlockingPartitionedNamespace, Req, Bytes) -> lance_core::Result<Resp>,
+{
+    let namespace = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: Req = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    let data_vec = env.convert_byte_array(request_data)?;
+    let data = bytes::Bytes::from(data_vec);
+
+    let response = f(namespace, request, data)
+        .map_err(|e| Error::runtime_error(format!("Namespace operation failed: {}", e)))?;
+
+    let response_json = serde_json::to_string(&response)
+        .map_err(|e| Error::runtime_error(format!("Failed to serialize response: {}", e)))?;
+
+    env.new_string(response_json).map_err(Into::into)
+}
+
+/// Helper function for query methods that return byte arrays (PartitionedNamespace)
+fn call_partitioned_namespace_query_method<'local>(
+    env: &mut JNIEnv<'local>,
+    handle: jlong,
+    request_json: JString,
+) -> Result<JByteArray<'local>> {
+    let namespace = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+    let request_str: String = env.get_string(&request_json)?.into();
+    let request: QueryTableRequest = serde_json::from_str(&request_str)
+        .map_err(|e| Error::input_error(format!("Failed to parse request JSON: {}", e)))?;
+
+    let result_bytes = RT
+        .block_on(namespace.inner.query_table(request))
+        .map_err(|e| Error::runtime_error(format!("Query table failed: {}", e)))?;
+
+    let byte_array = env.byte_array_from_slice(&result_bytes)?;
+    Ok(byte_array)
+}
+
 /// Helper function to call namespace methods that return a response object (RestNamespace)
 fn call_rest_namespace_method<'local, Req, Resp, F>(
     env: &mut JNIEnv<'local>,
@@ -1540,4 +1688,740 @@ pub extern "system" fn Java_org_lance_namespace_RestAdapter_releaseNative(
             }
         }
     }
+}
+
+// ============================================================================
+// PartitionedNamespace JNI Functions
+// ============================================================================
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_createNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    properties_map: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        create_partitioned_namespace_internal(&mut env, properties_map, None),
+        0
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_createNativeWithProvider(
+    mut env: JNIEnv,
+    _obj: JObject,
+    properties_map: JObject,
+    context_provider: JObject,
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        create_partitioned_namespace_internal(&mut env, properties_map, Some(context_provider),),
+        0
+    )
+}
+
+fn create_partitioned_namespace_internal(
+    env: &mut JNIEnv,
+    properties_map: JObject,
+    context_provider: Option<JObject>,
+) -> Result<jlong> {
+    // Convert Java HashMap to Rust HashMap
+    let jmap = JMap::from_env(env, &properties_map)?;
+    let mut properties = to_rust_map(env, &jmap)?;
+
+    // Use the same key as DirectoryNamespace to locate root.
+    if !properties.contains_key("root") {
+        if let Some(location) = properties.get("location").cloned() {
+            properties.insert("root".to_string(), location);
+        }
+    }
+    let location = properties.get("root").cloned().ok_or_else(|| {
+        Error::input_error("Missing 'root' (or 'location') in configProperties".to_string())
+    })?;
+
+    // Build DirectoryNamespace using properties so we can reuse storage options, credential vending,
+    // and the Java dynamic context provider.
+    let mut dir_builder = DirectoryNamespaceBuilder::from_properties(properties, None)
+        .map_err(|e| {
+            Error::runtime_error(format!("Failed to create DirectoryNamespaceBuilder: {}", e))
+        })?
+        .manifest_enabled(true)
+        .dir_listing_enabled(false)
+        .inline_optimization_enabled(true);
+
+    if let Some(provider_obj) = context_provider {
+        if !provider_obj.is_null() {
+            let java_provider = JavaDynamicContextProvider::new(env, &provider_obj)?;
+            dir_builder = dir_builder.context_provider(Arc::new(java_provider));
+        }
+    }
+
+    let directory = RT
+        .block_on(dir_builder.build())
+        .map_err(|e| Error::runtime_error(format!("Failed to build DirectoryNamespace: {}", e)))?;
+
+    let builder = PartitionedNamespaceBuilder::new(location).directory(directory);
+    let ns = RT
+        .block_on(builder.load())
+        .map_err(|e| Error::runtime_error(format!("Failed to load PartitionedNamespace: {}", e)))?;
+
+    Ok(Box::into_raw(Box::new(BlockingPartitionedNamespace { inner: ns })) as jlong)
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_releaseNative(
+    _env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) {
+    if handle != 0 {
+        unsafe {
+            let _ = Box::from_raw(handle as *mut BlockingPartitionedNamespace);
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_namespaceIdNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) -> jstring {
+    let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+    let namespace_id = ns.inner.namespace_id();
+    ok_or_throw_with_return!(
+        env,
+        env.new_string(namespace_id).map_err(Error::from),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_listNamespacesNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.list_namespaces(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_describeNamespaceNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.describe_namespace(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_createNamespaceNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.create_namespace(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_dropNamespaceNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.drop_namespace(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_namespaceExistsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) {
+    ok_or_throw_without_return!(
+        env,
+        call_partitioned_namespace_void_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.namespace_exists(req))
+        })
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_listTablesNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.list_tables(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_describeTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.describe_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_registerTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.register_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_tableExistsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) {
+    ok_or_throw_without_return!(
+        env,
+        call_partitioned_namespace_void_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.table_exists(req))
+        })
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_dropTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.drop_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_deregisterTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.deregister_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_countTableRowsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jlong {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_count_method(&mut env, handle, request_json),
+        0
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_createTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+    request_data: JByteArray,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_with_data_method(
+            &mut env,
+            handle,
+            request_json,
+            request_data,
+            |ns, req, data| { RT.block_on(ns.inner.create_table(req, data)) }
+        ),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+#[allow(deprecated)]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_createEmptyTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.create_empty_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_declareTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.declare_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_insertIntoTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+    request_data: JByteArray,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_with_data_method(
+            &mut env,
+            handle,
+            request_json,
+            request_data,
+            |ns, req, data| { RT.block_on(ns.inner.insert_into_table(req, data)) }
+        ),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_mergeInsertIntoTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+    request_data: JByteArray,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_with_data_method(
+            &mut env,
+            handle,
+            request_json,
+            request_data,
+            |ns, req, data| { RT.block_on(ns.inner.merge_insert_into_table(req, data)) }
+        ),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_updateTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.update_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_deleteFromTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.delete_from_table(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_queryTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jbyteArray {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_query_method(&mut env, handle, request_json),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_createTableIndexNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.create_table_index(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_listTableIndicesNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.list_table_indices(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_describeTableIndexStatsNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.describe_table_index_stats(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_describeTransactionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.describe_transaction(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_alterTransactionNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    request_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        call_partitioned_namespace_method(&mut env, handle, request_json, |ns, req| {
+            RT.block_on(ns.inner.alter_transaction(req))
+        }),
+        std::ptr::null_mut()
+    )
+    .into_raw()
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_schemaNative<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject,
+    handle: jlong,
+) -> JObject<'local> {
+    ok_or_throw!(env, {
+        let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+        ns.inner.schema().into_java(&mut env)
+    })
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_planScanNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    filter: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        (|| {
+            let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+            let filter: String = env.get_string(&filter)?.into();
+            // Use the partitioned namespace schema to resolve column references.
+            let arrow_schema: ArrowSchema = (&ns.inner.schema()).into();
+            let expr = RT
+                .block_on(
+                    lance_namespace_impls::partition::parse_filter_expr_from_sql(
+                        &filter,
+                        &arrow_schema,
+                    ),
+                )
+                .map_err(|e| Error::runtime_error(format!("Failed to parse filter SQL: {}", e)))?;
+            let planned = RT
+                .block_on(ns.inner.plan_scan(&expr))
+                .map_err(|e| Error::runtime_error(format!("plan_scan failed: {}", e)))?;
+
+            let items: Vec<JavaPlanScanItem> = planned
+                .into_iter()
+                .map(|(t, refine)| JavaPlanScanItem {
+                    table: to_java_partition_table(&t),
+                    refine_expr: refine.to_string(),
+                })
+                .collect();
+
+            let json = serde_json::to_string(&items)
+                .map_err(|e| Error::runtime_error(format!("Failed to serialize plan: {}", e)))?;
+            Ok::<jstring, Error>(env.new_string(json)?.into_raw())
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_partitioningNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        (|| {
+            let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+            let partitioning = RT
+                .block_on(ns.inner.partitioning())
+                .map_err(|e| Error::runtime_error(format!("partitioning failed: {}", e)))?;
+            let specs: Vec<JsonPartitionSpec> =
+                partitioning.all().iter().map(|s| s.to_json()).collect();
+            let json = serde_json::to_string(&specs).map_err(|e| {
+                Error::runtime_error(format!("Failed to serialize partitioning: {}", e))
+            })?;
+            Ok::<jstring, Error>(env.new_string(json)?.into_raw())
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_updatePartitionSpecNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    partition_fields_json: JString,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        (|| {
+            let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+            let json: String = env.get_string(&partition_fields_json)?.into();
+            let json_fields: Vec<JsonPartitionField> = serde_json::from_str(&json)
+                .map_err(|e| Error::input_error(format!("Invalid partition fields JSON: {}", e)))?;
+            let mut fields = Vec::with_capacity(json_fields.len());
+            for jf in &json_fields {
+                fields.push(
+                    PartitionField::from_json(jf).map_err(|e| {
+                        Error::input_error(format!("Invalid partition field: {}", e))
+                    })?,
+                );
+            }
+            let spec = RT
+                .block_on(ns.inner.update_partition_spec(fields))
+                .map_err(|e| {
+                    Error::runtime_error(format!("update_partition_spec failed: {}", e))
+                })?;
+            let json = serde_json::to_string(&spec.to_json()).map_err(|e| {
+                Error::runtime_error(format!("Failed to serialize partition spec: {}", e))
+            })?;
+            Ok::<jstring, Error>(env.new_string(json)?.into_raw())
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_resolveOrCreatePartitionTableNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+    arrow_array_stream_addr: jlong,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        (|| {
+            use arrow::ffi_stream::{ArrowArrayStreamReader, FFI_ArrowArrayStream};
+            let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+            let stream_ptr = arrow_array_stream_addr as *mut FFI_ArrowArrayStream;
+            let mut reader =
+                unsafe { ArrowArrayStreamReader::from_raw(stream_ptr) }.map_err(|e| {
+                    Error::runtime_error(format!("Failed to import ArrowArrayStream: {}", e))
+                })?;
+
+            let batch = reader
+                .next()
+                .transpose()
+                .map_err(|e| Error::runtime_error(format!("Failed to read record batch: {}", e)))?
+                .ok_or_else(|| Error::input_error("Empty ArrowArrayStream".to_string()))?;
+
+            if batch.num_rows() != 1 {
+                return Err(Error::input_error(format!(
+                    "resolve_or_create_partition_table expects exactly 1 row, got {}",
+                    batch.num_rows()
+                )));
+            }
+
+            let table = RT
+                .block_on(ns.inner.resolve_or_create_partition_table(&batch))
+                .map_err(|e| {
+                    Error::runtime_error(format!("resolve_or_create_partition_table failed: {}", e))
+                })?;
+            let json = serde_json::to_string(&to_java_partition_table(&table))
+                .map_err(|e| Error::runtime_error(format!("Failed to serialize table: {}", e)))?;
+            Ok::<jstring, Error>(env.new_string(json)?.into_raw())
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_tablesNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    handle: jlong,
+) -> jstring {
+    ok_or_throw_with_return!(
+        env,
+        (|| {
+            let ns = unsafe { &*(handle as *const BlockingPartitionedNamespace) };
+            let tables = RT.block_on(ns.inner.tables()).map_err(|e| {
+                Error::runtime_error(format!("PartitionedNamespace.tables failed: {}", e))
+            })?;
+
+            let java_tables: Vec<JavaPartitionTable> =
+                tables.iter().map(to_java_partition_table).collect();
+            let json = serde_json::to_string(&java_tables)
+                .map_err(|e| Error::runtime_error(format!("Failed to serialize tables: {}", e)))?;
+
+            Ok::<jstring, Error>(env.new_string(json)?.into_raw())
+        })(),
+        std::ptr::null_mut()
+    )
+}
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_namespace_PartitionedNamespace_commitNative(
+    mut env: JNIEnv,
+    _obj: JObject,
+    _handle: jlong,
+    _read_version_json: JObject,
+    _new_version_json: JObject,
+) -> jstring {
+    let err = Error::runtime_error("PartitionedNamespace.commit is not implemented".to_string());
+    err.throw(&mut env);
+    std::ptr::null_mut()
 }
