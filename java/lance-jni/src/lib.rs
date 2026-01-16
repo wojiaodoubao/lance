@@ -52,6 +52,7 @@ mod index;
 mod merge_insert;
 mod namespace;
 mod optimize;
+mod partition;
 mod schema;
 mod session;
 mod sql;

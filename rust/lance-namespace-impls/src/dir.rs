@@ -8,6 +8,7 @@
 
 pub mod manifest;
 
+use crate::context::DynamicContextProvider;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -16,6 +17,7 @@ use futures::TryStreamExt;
 use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
+use lance_core::{box_error, Error, Result};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_table::io::commit::ManifestNamingScheme;
 use object_store::path::Path;
@@ -24,7 +26,6 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     BatchDeleteTableVersionsRequest, BatchDeleteTableVersionsResponse, CreateEmptyTableRequest,
     CreateEmptyTableResponse, CreateNamespaceRequest, CreateNamespaceResponse, CreateTableRequest,
@@ -36,14 +37,14 @@ use lance_namespace::models::{
     ListTableVersionsRequest, ListTableVersionsResponse, ListTablesRequest, ListTablesResponse,
     NamespaceExistsRequest, TableExistsRequest, TableVersion,
 };
-
-use lance_core::{box_error, Error, Result};
 use lance_namespace::schema::arrow_schema_to_json;
 use lance_namespace::LanceNamespace;
+use snafu::location;
 
 use crate::credentials::{
     create_credential_vendor_for_location, has_credential_vendor_config, CredentialVendor,
 };
+use crate::ManifestNamespace;
 
 /// Result of checking table status atomically.
 ///
@@ -602,6 +603,16 @@ impl std::fmt::Display for DirectoryNamespace {
 }
 
 impl DirectoryNamespace {
+    pub fn manifest_namespace(&self) -> Result<Arc<ManifestNamespace>> {
+        match self.manifest_ns {
+            Some(ref ns) => Ok(ns.clone()),
+            None => Err(Error::Namespace {
+                source: "Not manifest namespace".into(),
+                location: location!(),
+            }),
+        }
+    }
+
     /// Apply pagination to a list of table names
     ///
     /// Sorts the list alphabetically and applies pagination using page_token (start_after) and limit.

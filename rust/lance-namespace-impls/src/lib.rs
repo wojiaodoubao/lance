@@ -72,12 +72,15 @@ pub mod connect;
 pub mod context;
 pub mod credentials;
 pub mod dir;
+pub mod udf;
 
 #[cfg(feature = "rest")]
 pub mod rest;
 
+pub mod partition;
 #[cfg(feature = "rest-adapter")]
 pub mod rest_adapter;
+mod util;
 
 // Re-export connect builder
 pub use connect::ConnectBuilder;
