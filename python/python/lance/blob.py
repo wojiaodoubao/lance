@@ -279,6 +279,36 @@ class BlobFile(io.RawIOBase):
         """
         return self.inner.size()
 
+    def location(self, expires_in: int | None = None) -> dict[str, Any]:
+        """Return a general accessible location along with byte range for this blob.
+
+        Parameters
+        ----------
+        expires_in:
+            The expires duration in seconds of the URL. Default is 1h.
+
+        Returns
+        -------
+        a dict includes `url`, `location_uri` and `headers`. For example:
+
+        ```json
+        {
+            "location_uri": "s3://bucket/path/to/object",
+            "url": <s3_presigned_url>,
+            "headers": {
+                "Range": "1024-2048"
+            }
+        }
+        ```
+
+        Notes
+        -----
+        If the backend does not support pre-signed URLs for this blob, this
+        method only returns a dict with `location_uri`.
+        """
+
+        return self.inner.location(expires_in)
+
     def readall(self) -> bytes:
         return self.inner.readall()
 

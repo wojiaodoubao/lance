@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
+use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc, time::Duration};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
@@ -635,6 +635,39 @@ impl BlobFile {
     pub fn uri(&self) -> Option<&str> {
         self.uri.as_deref()
     }
+
+    /// Return a general accessible location and byte range for this blob.
+    ///
+    /// The returned location consists of:
+    /// - a stable location URI derived from the dataset's object store.
+    /// - an optional HTTP(S) URL, which is a pre-signed URL, None if
+    ///   the backend does not provide pre-signed URL.
+    /// - a byte range `(offset, length)` describing the blob payload
+    ///   inside the underlying object.
+    pub async fn location(
+        &self,
+        expires: Option<Duration>,
+    ) -> Result<(String, Option<String>, (u64, u64))> {
+        let range = self.range();
+
+        let location_uri = self.object_store.location_uri(&self.path)?.to_string();
+
+        let expires = expires.unwrap_or(Duration::from_secs(3600));
+        let url = self
+            .object_store
+            .presigned_url(&self.path, expires)
+            .await?
+            .map(|u| u.to_string());
+
+        Ok((location_uri, url, range))
+    }
+
+    fn range(&self) -> (u64, u64) {
+        match self.kind {
+            BlobKind::Inline | BlobKind::Packed => (self.position, self.size),
+            BlobKind::Dedicated | BlobKind::External => (0, self.size),
+        }
+    }
 }
 
 pub(super) async fn take_blobs(
@@ -1148,6 +1181,33 @@ mod tests {
         assert_eq!(data_file_key_from_path("data/abc.lance"), "abc");
         assert_eq!(data_file_key_from_path("abc.lance"), "abc");
         assert_eq!(data_file_key_from_path("nested/path/xyz"), "xyz");
+    }
+
+    #[tokio::test]
+    async fn test_blob_urls_file_store() {
+        let fixture = BlobTestFixture::new().await;
+
+        let row_ids = fixture
+            .dataset
+            .scan()
+            .project::<String>(&[])
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = row_ids.column(0).as_primitive::<UInt64Type>().values();
+        let row_ids = vec![row_ids[0]];
+
+        let blobs = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
+        let blob = blobs.first().unwrap();
+
+        let (location_uri, presigned_url, (offset, length)) = blob.location(None).await.unwrap();
+        assert!(presigned_url.is_none());
+        assert!(!location_uri.is_empty());
+        assert!(location_uri.starts_with("file://"));
+        assert_eq!(offset, blob.position());
+        assert_eq!(length, blob.size());
     }
 
     #[tokio::test]

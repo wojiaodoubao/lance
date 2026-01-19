@@ -33,6 +33,7 @@ use url::Url;
 
 use super::local::LocalObjectReader;
 mod list_retry;
+pub mod object_url;
 pub mod providers;
 pub mod storage_options;
 mod tracing;
@@ -133,6 +134,8 @@ pub struct ObjectStore {
     /// which usually cannot be found in the URL such as Azure account name. The prefix plus the
     /// path uniquely identifies any object inside the store.
     pub store_prefix: String,
+    /// Provider for generating pre-signed URLs for objects.
+    url_provider: Arc<object_url::ObjectUrl>,
 }
 
 impl DeepSizeOf for ObjectStore {
@@ -336,7 +339,7 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
     }
 }
 
-fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
+pub fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     let expanded = tilde(str_path.as_ref()).to_string();
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
@@ -438,9 +441,13 @@ impl ObjectStore {
             let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
+            let scheme = path.scheme().to_string();
+            let url_provider: Arc<object_url::ObjectUrl> =
+                Arc::new(object_url::ObjectUrl::new(scheme.clone(), None, None));
+
             let store = Self {
                 inner: tracked_store,
-                scheme: path.scheme().to_string(),
+                scheme,
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -449,6 +456,7 @@ impl ObjectStore {
                 download_retry_count: DEFAULT_DOWNLOAD_RETRY_COUNT,
                 io_tracker,
                 store_prefix,
+                url_provider,
             };
             let path = Path::parse(path.path())?;
             return Ok((Arc::new(store), path));
@@ -792,6 +800,16 @@ impl ObjectStore {
         let reader = self.open(path).await?;
         Ok(reader.get_range(range).await?)
     }
+
+    /// Generate a pre-signed URL for an object at the given path.
+    pub async fn presigned_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
+        self.url_provider.presigned_url(path, expires).await
+    }
+
+    /// Generate a stable location URI derived from the store prefix and path.
+    pub fn location_uri(&self, path: &Path) -> Result<Url> {
+        self.url_provider.location_uri(path)
+    }
 }
 
 /// Options that can be set for multiple object stores
@@ -929,9 +947,13 @@ impl ObjectStore {
         let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
+        let scheme_str = scheme.to_string();
+        let url_provider: Arc<object_url::ObjectUrl> =
+            Arc::new(object_url::ObjectUrl::new(scheme_str.clone(), None, None));
+
         Self {
             inner: tracked_store,
-            scheme: scheme.into(),
+            scheme: scheme_str,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
@@ -940,6 +962,7 @@ impl ObjectStore {
             download_retry_count,
             io_tracker,
             store_prefix,
+            url_provider,
         }
     }
 }
@@ -1331,6 +1354,43 @@ mod tests {
         assert!(dest_file.exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_file_urls() {
+        let tmp_dir = TempStdDir::default();
+        let lance_path = tmp_dir.join("foo.lance");
+        let file_path = lance_path.join("test_file");
+        write_to_file(file_path.to_str().unwrap(), "SIGNED_URL").unwrap();
+
+        let uri = lance_path.to_str().unwrap();
+        let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
+        let path = base.child("test_file");
+
+        let signed = store
+            .presigned_url(&path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let object = store.location_uri(&path).unwrap();
+
+        assert!(signed.is_none());
+        assert_eq!(object.scheme(), "file");
+        assert!(object.as_str().starts_with("file://"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_urls() {
+        let store = ObjectStore::memory();
+        let path = Path::from("path/to/file");
+
+        let object_url = store.location_uri(&path).unwrap();
+        assert_eq!(object_url.as_str(), "memory:///path/to/file");
+
+        let signed_url = store
+            .presigned_url(&path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(signed_url.is_none());
     }
 
     #[tokio::test]

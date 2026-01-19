@@ -9,11 +9,12 @@ use opendal::{services::Gcs, Operator};
 use snafu::location;
 
 use object_store::{
-    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
+    gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
     RetryConfig, StaticCredentialProvider,
 };
 use url::Url;
 
+use crate::object_store::object_url::ObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -28,7 +29,7 @@ impl GcsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<(Arc<dyn OSObjectStore>, Operator)> {
         let bucket = base_path
             .host_str()
             .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name", location!()))?
@@ -56,14 +57,15 @@ impl GcsStoreProvider {
             })?
             .finish();
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        let inner = Arc::new(OpendalStore::new(operator.clone())) as Arc<dyn OSObjectStore>;
+        Ok((inner, operator))
     }
 
     async fn build_google_cloud_store(
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<GoogleCloudStorage>> {
         let max_retries = storage_options.client_max_retries();
         let retry_timeout = storage_options.client_retry_timeout();
         let retry_config = RetryConfig {
@@ -87,7 +89,7 @@ impl GcsStoreProvider {
             builder = builder.with_credentials(credential_provider);
         }
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 }
 
@@ -106,16 +108,33 @@ impl ObjectStoreProvider for GcsStoreProvider {
             .map(|v| v.as_str() == "true")
             .unwrap_or(false);
 
-        let inner = if use_opendal {
-            self.build_opendal_gcs_store(&base_path, &storage_options)
-                .await?
+        let (inner, signer, opendal_operator) = if use_opendal {
+            let (inner, operator) = self
+                .build_opendal_gcs_store(&base_path, &storage_options)
+                .await?;
+            (inner, None, Some(operator))
         } else {
-            self.build_google_cloud_store(&base_path, &storage_options)
-                .await?
+            let gcs = self
+                .build_google_cloud_store(&base_path, &storage_options)
+                .await?;
+            (
+                gcs.clone() as Arc<dyn OSObjectStore>,
+                Some(gcs as Arc<dyn object_store::signer::Signer>),
+                None,
+            )
         };
+
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let url_provider = Arc::new(ObjectUrl::new(
+            store_prefix.clone(),
+            signer,
+            opendal_operator,
+        ));
 
         Ok(ObjectStore {
             inner,
+            url_provider,
             scheme: String::from("gs"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -124,8 +143,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            store_prefix,
         })
     }
 }

@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use pyo3::{
     exceptions::PyValueError,
     pyclass, pymethods,
-    types::{PyByteArray, PyByteArrayMethods, PyBytes},
+    types::{PyByteArray, PyByteArrayMethods, PyBytes, PyDictMethods},
     Bound, PyResult, Python,
 };
 
@@ -54,6 +54,32 @@ impl LanceBlobFile {
 
     pub fn size(&self) -> u64 {
         self.inner.size()
+    }
+
+    #[pyo3(signature = (expires_in_seconds=None))]
+    pub fn location<'py>(
+        &self,
+        py: Python<'py>,
+        expires_in_seconds: Option<u64>,
+    ) -> PyResult<Bound<'py, pyo3::types::PyDict>> {
+        let inner = self.inner.clone();
+        let expires = expires_in_seconds.map(Duration::from_secs);
+        let (location_uri, url_opt, (offset, length)) = rt()
+            .block_on(Some(py), inner.location(expires))?
+            .infer_error()?;
+
+        let dict = pyo3::types::PyDict::new(py);
+        dict.set_item("location_uri", location_uri)?;
+
+        if let Some(url) = url_opt {
+            dict.set_item("url", url)?;
+        }
+
+        let headers = pyo3::types::PyDict::new(py);
+        headers.set_item("Range", format!("bytes={}-{}", offset, offset + length - 1))?;
+        dict.set_item("headers", headers)?;
+
+        Ok(dict)
     }
 
     pub fn readall<'a>(&'a self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {
