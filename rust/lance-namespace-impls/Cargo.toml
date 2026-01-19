@@ -29,6 +29,7 @@ credential-vendor-azure = ["dep:azure_core", "dep:azure_identity", "dep:azure_st
 [dependencies]
 lance-namespace.workspace = true
 lance-core.workspace = true
+lance-namespace-reqwest-client.workspace = true
 
 # REST implementation dependencies (optional, enabled by "rest" feature)
 reqwest = { version = "0.12", optional = true, default-features = false, features = [

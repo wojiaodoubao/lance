@@ -63,7 +63,7 @@ lance-io = { version = "=2.0.0-beta.10", path = "./rust/lance-io", default-featu
 lance-linalg = { version = "=2.0.0-beta.10", path = "./rust/lance-linalg" }
 lance-namespace = { version = "=2.0.0-beta.10", path = "./rust/lance-namespace" }
 lance-namespace-impls = { version = "=2.0.0-beta.10", path = "./rust/lance-namespace-impls" }
-lance-namespace-reqwest-client = { version = "=0.4.5" }
+lance-namespace-reqwest-client = { git = "https://github.com/wojiaodoubao/lance-namespace", branch = "rest-table-properties" }
 lance-table = { version = "=2.0.0-beta.10", path = "./rust/lance-table" }
 lance-test-macros = { version = "=2.0.0-beta.10", path = "./rust/lance-test-macros" }
 lance-testing = { version = "=2.0.0-beta.10", path = "./rust/lance-testing" }

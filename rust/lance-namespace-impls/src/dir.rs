@@ -8,6 +8,7 @@
 
 pub mod manifest;
 
+use crate::context::DynamicContextProvider;
 use arrow::record_batch::RecordBatchIterator;
 use arrow_ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -15,13 +16,7 @@ use bytes::Bytes;
 use lance::dataset::{Dataset, WriteParams};
 use lance::session::Session;
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
-use object_store::path::Path;
-use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
-use std::collections::HashMap;
-use std::io::Cursor;
-use std::sync::Arc;
 
-use crate::context::DynamicContextProvider;
 use lance_namespace::models::{
     CreateEmptyTableRequest, CreateEmptyTableResponse, CreateNamespaceRequest,
     CreateNamespaceResponse, CreateTableRequest, CreateTableResponse, DeclareTableRequest,
@@ -30,6 +25,11 @@ use lance_namespace::models::{
     DropTableRequest, DropTableResponse, Identity, ListNamespacesRequest, ListNamespacesResponse,
     ListTablesRequest, ListTablesResponse, NamespaceExistsRequest, TableExistsRequest,
 };
+use object_store::path::Path;
+use object_store::{Error as ObjectStoreError, ObjectStore as OSObjectStore, PutMode, PutOptions};
+use std::collections::HashMap;
+use std::io::Cursor;
+use std::sync::Arc;
 
 use lance_core::{box_error, Error, Result};
 use lance_namespace::schema::arrow_schema_to_json;

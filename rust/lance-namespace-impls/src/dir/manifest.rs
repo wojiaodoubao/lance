@@ -99,6 +99,7 @@ pub struct TableInfo {
     pub namespace: Vec<String>,
     pub name: String,
     pub location: String,
+    pub properties: Option<HashMap<String, String>>,
 }
 
 /// Information about a namespace stored in the manifest
@@ -711,12 +712,6 @@ impl ManifestNamespace {
             source: box_error(std::io::Error::other(format!("Failed to filter: {}", e))),
             location: location!(),
         })?;
-        scanner
-            .project(&["object_id", "location"])
-            .map_err(|e| Error::IO {
-                source: box_error(std::io::Error::other(format!("Failed to project: {}", e))),
-                location: location!(),
-            })?;
         let batches = Self::execute_scanner(scanner).await?;
 
         let mut found_result: Option<TableInfo> = None;
@@ -738,6 +733,33 @@ impl ManifestNamespace {
                 ));
             }
 
+            // Parse properties
+            let mut merged = self.batch_to_extended_props(&batch);
+            let metadata_array = Self::get_string_column(&batch, "metadata")?;
+
+            if !metadata_array.is_null(0) {
+                let metadata_str = metadata_array.value(0);
+                match serde_json::from_str::<HashMap<String, String>>(metadata_str) {
+                    Ok(map) => merged.extend(map),
+                    Err(e) => {
+                        return Err(Error::io(
+                            format!(
+                                "Failed to deserialize metadata for table '{}': {}",
+                                object_id, e
+                            ),
+                            location!(),
+                        ));
+                    }
+                }
+            }
+
+            let properties = if merged.is_empty() {
+                None
+            } else {
+                Some(merged)
+            };
+
+            // Parse object ID and location
             let object_id_array = Self::get_string_column(&batch, "object_id")?;
             let location_array = Self::get_string_column(&batch, "location")?;
             let location = location_array.value(0).to_string();
@@ -746,6 +768,7 @@ impl ManifestNamespace {
                 namespace,
                 name,
                 location,
+                properties,
             });
         }
 
@@ -1115,6 +1138,20 @@ impl ManifestNamespace {
         }
     }
 
+    fn build_metadata_json(properties: &Option<HashMap<String, String>>) -> Option<String> {
+        properties.as_ref().and_then(|props| {
+            if props.is_empty() {
+                None
+            } else {
+                let meta_props = props
+                    .iter()
+                    .filter(|(key, _)| !key.starts_with(EXTENDED_PREFIX))
+                    .collect::<HashMap<_, _>>();
+                Some(serde_json::to_string(&meta_props).ok()?)
+            }
+        })
+    }
+
     fn batch_to_extended_props(&self, batch: &RecordBatch) -> HashMap<String, String> {
         let basic_schema = Self::basic_manifest_schema();
         let mut excluded_col: Vec<&str> = vec![];
@@ -1238,6 +1275,7 @@ impl LanceNamespace for ManifestNamespace {
                         location: Some(table_uri.clone()),
                         table_uri: Some(table_uri),
                         storage_options,
+                        properties: info.properties,
                         ..Default::default()
                     });
                 }
@@ -1263,6 +1301,7 @@ impl LanceNamespace for ManifestNamespace {
                             table_uri: Some(table_uri),
                             schema: Some(Box::new(json_schema)),
                             storage_options,
+                            properties: info.properties,
                             ..Default::default()
                         })
                     }
@@ -1274,6 +1313,7 @@ impl LanceNamespace for ManifestNamespace {
                             location: Some(table_uri.clone()),
                             table_uri: Some(table_uri),
                             storage_options,
+                            properties: info.properties,
                             ..Default::default()
                         })
                     }
@@ -1331,6 +1371,15 @@ impl LanceNamespace for ManifestNamespace {
 
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
+
+        // Serialize properties and compute extended batch if provided
+        let metadata = Self::build_metadata_json(&request.properties);
+
+        let extended_batch = if let Some(props) = &request.properties {
+            self.extended_props_to_batch(props).await?
+        } else {
+            None
+        };
 
         // Check if table already exists in manifest
         if self.manifest_contains_object(&object_id).await? {
@@ -1394,13 +1443,21 @@ impl LanceNamespace for ManifestNamespace {
             })?;
 
         // Register in manifest (store dir_name, not full URI)
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
-            .await?;
+        self.insert_into_manifest_with_metadata(
+            object_id,
+            ObjectType::Table,
+            Some(dir_name),
+            metadata,
+            None,
+            extended_batch,
+        )
+        .await?;
 
         Ok(CreateTableResponse {
             version: Some(1),
             location: Some(table_uri),
             storage_options: self.storage_options.clone(),
+            properties: request.properties.clone(),
             ..Default::default()
         })
     }
@@ -1572,20 +1629,9 @@ impl LanceNamespace for ManifestNamespace {
             });
         }
 
-        // Serialize properties if provided
-        let metadata = request.properties.as_ref().and_then(|props| {
-            if props.is_empty() {
-                None
-            } else {
-                let meta_props = props
-                    .iter()
-                    .filter(|(key, _)| !key.starts_with(EXTENDED_PREFIX))
-                    .collect::<HashMap<_, _>>();
-                Some(serde_json::to_string(&meta_props).ok()?)
-            }
-        });
+        // Serialize properties and compute extended batch if provided
+        let metadata = Self::build_metadata_json(&request.properties);
 
-        // Compute extended batch
         let extended_batch = if let Some(props) = &request.properties {
             self.extended_props_to_batch(props).await?
         } else {
@@ -1710,6 +1756,15 @@ impl LanceNamespace for ManifestNamespace {
         let (namespace, table_name) = Self::split_object_id(table_id);
         let object_id = Self::build_object_id(&namespace, &table_name);
 
+        // Serialize properties and compute extended batch if provided
+        let metadata = Self::build_metadata_json(&request.properties);
+
+        let extended_batch = if let Some(props) = &request.properties {
+            self.extended_props_to_batch(props).await?
+        } else {
+            None
+        };
+
         // Check if table already exists in manifest
         let existing = self.query_manifest_for_table(&object_id).await?;
         if existing.is_some() {
@@ -1773,8 +1828,15 @@ impl LanceNamespace for ManifestNamespace {
             })?;
 
         // Add entry to manifest marking this as an empty table (store dir_name, not full path)
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
-            .await?;
+        self.insert_into_manifest_with_metadata(
+            object_id,
+            ObjectType::Table,
+            Some(dir_name),
+            metadata,
+            None,
+            extended_batch,
+        )
+        .await?;
 
         log::info!(
             "Created empty table '{}' in manifest at {}",
@@ -1793,6 +1855,7 @@ impl LanceNamespace for ManifestNamespace {
         Ok(CreateEmptyTableResponse {
             location: Some(table_uri),
             storage_options,
+            properties: request.properties,
             ..Default::default()
         })
     }
@@ -1821,6 +1884,15 @@ impl LanceNamespace for ManifestNamespace {
                 location: location!(),
             });
         }
+
+        // Serialize properties and compute extended batch if provided
+        let metadata = Self::build_metadata_json(&request.properties);
+
+        let extended_batch = if let Some(props) = &request.properties {
+            self.extended_props_to_batch(props).await?
+        } else {
+            None
+        };
 
         // Create table location path with hash-based naming
         // When dir_listing_enabled is true and it's a root table, use directory-style naming: {table_name}.lance
@@ -1876,8 +1948,15 @@ impl LanceNamespace for ManifestNamespace {
             })?;
 
         // Add entry to manifest marking this as a declared table (store dir_name, not full path)
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(dir_name))
-            .await?;
+        self.insert_into_manifest_with_metadata(
+            object_id,
+            ObjectType::Table,
+            Some(dir_name),
+            metadata,
+            None,
+            extended_batch,
+        )
+        .await?;
 
         log::info!(
             "Declared table '{}' in manifest at {}",
@@ -1896,6 +1975,7 @@ impl LanceNamespace for ManifestNamespace {
         Ok(DeclareTableResponse {
             location: Some(table_uri),
             storage_options,
+            properties: request.properties.clone(),
             ..Default::default()
         })
     }
@@ -1964,12 +2044,29 @@ impl LanceNamespace for ManifestNamespace {
             });
         }
 
+        // Serialize properties and compute extended batch if provided
+        let metadata = Self::build_metadata_json(&request.properties);
+
+        let extended_batch = if let Some(props) = &request.properties {
+            self.extended_props_to_batch(props).await?
+        } else {
+            None
+        };
+
         // Register the table with its location in the manifest
-        self.insert_into_manifest(object_id, ObjectType::Table, Some(location.clone()))
-            .await?;
+        self.insert_into_manifest_with_metadata(
+            object_id,
+            ObjectType::Table,
+            Some(location.clone()),
+            metadata,
+            None,
+            extended_batch,
+        )
+        .await?;
 
         Ok(RegisterTableResponse {
             location: Some(location),
+            properties: request.properties.clone(),
             ..Default::default()
         })
     }
@@ -2223,11 +2320,14 @@ mod tests {
     use lance_core::utils::tempfile::TempStdDir;
     use lance_io::object_store::ObjectStore;
     use lance_namespace::models::{
-        CreateNamespaceRequest, CreateTableRequest, DescribeNamespaceRequest, DescribeTableRequest,
-        DropTableRequest, ListTablesRequest, TableExistsRequest,
+        CreateEmptyTableRequest, CreateNamespaceRequest, CreateTableRequest,
+        DescribeNamespaceRequest, DescribeTableRequest, DropTableRequest, ListTablesRequest,
+        RegisterTableRequest, TableExistsRequest,
     };
     use lance_namespace::LanceNamespace;
+    use lance_namespace_reqwest_client::models::DeclareTableRequest;
     use rstest::rstest;
+    use std::collections::HashMap;
 
     fn create_test_ipc_data() -> Vec<u8> {
         use arrow::array::{Int32Array, StringArray};
@@ -3172,6 +3272,397 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_table_with_properties_persisted(#[case] inline_optimization: bool) {
+        let (_temp_dir, manifest_ns, properties) =
+            create_manifest_and_persist_properties(inline_optimization).await;
+
+        let buffer = create_test_ipc_data();
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(properties);
+
+        manifest_ns
+            .create_table(create_req, Bytes::from(buffer))
+            .await
+            .unwrap();
+        verify_persist_properties(&manifest_ns, "test_table").await;
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_table_with_properties_persisted(#[case] inline_optimization: bool) {
+        let (_temp_dir, manifest_ns, properties) =
+            create_manifest_and_persist_properties(inline_optimization).await;
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(properties);
+
+        manifest_ns.declare_table(declare_req).await.unwrap();
+        verify_persist_properties(&manifest_ns, "test_table").await;
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_register_table_with_properties_persisted(#[case] inline_optimization: bool) {
+        let (_temp_dir, manifest_ns, properties) =
+            create_manifest_and_persist_properties(inline_optimization).await;
+
+        let mut register_req = RegisterTableRequest::new("registered_table.lance".to_string());
+        register_req.id = Some(vec!["registered_table".to_string()]);
+        register_req.properties = Some(properties);
+
+        LanceNamespace::register_table(&manifest_ns, register_req)
+            .await
+            .unwrap();
+        verify_persist_properties(&manifest_ns, "registered_table").await;
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_empty_table_persist_properties(#[case] inline_optimization: bool) {
+        let (_temp_dir, manifest_ns, properties) =
+            create_manifest_and_persist_properties(inline_optimization).await;
+
+        let mut request = CreateEmptyTableRequest::new();
+        request.id = Some(vec!["empty_table".to_string()]);
+        request.properties = Some(properties);
+
+        #[allow(deprecated)]
+        manifest_ns.create_empty_table(request).await.unwrap();
+        verify_persist_properties(&manifest_ns, "empty_table").await;
+    }
+
+    async fn create_manifest_and_persist_properties(
+        inline_optimization: bool,
+    ) -> (TempStdDir, ManifestNamespace, HashMap<String, String>) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let mut manifest_ns =
+            create_manifest_namespace_for_test(temp_path, inline_optimization).await;
+
+        manifest_ns
+            .add_extended_properties(&vec![
+                ("lance.manifest.extended.user_id", DataType::Utf8),
+                ("lance.manifest.extended.score", DataType::Int32),
+            ])
+            .await
+            .unwrap();
+
+        let properties = std::collections::HashMap::from([
+            ("owner".to_string(), "alice".to_string()),
+            (
+                "lance.manifest.extended.user_id".to_string(),
+                "123".to_string(),
+            ),
+            (
+                "lance.manifest.extended.score".to_string(),
+                "42".to_string(),
+            ),
+        ]);
+
+        (temp_dir, manifest_ns, properties)
+    }
+
+    async fn verify_persist_properties(manifest_ns: &ManifestNamespace, table: &str) {
+        let object_id = ManifestNamespace::build_object_id(&[], table);
+        let mut scanner = manifest_ns.manifest_scanner().await.unwrap();
+        let filter = format!("object_id = '{}'", object_id);
+        scanner.filter(&filter).unwrap();
+        scanner.project(&["metadata", "user_id", "score"]).unwrap();
+        let batches = ManifestNamespace::execute_scanner(scanner).await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let metadata_array = ManifestNamespace::get_string_column(batch, "metadata").unwrap();
+        let metadata_str = metadata_array.value(0);
+        let metadata_map: std::collections::HashMap<String, String> =
+            serde_json::from_str(metadata_str).unwrap();
+        assert_eq!(metadata_map.get("owner"), Some(&"alice".to_string()));
+
+        let user_id_array = ManifestNamespace::get_string_column(batch, "user_id").unwrap();
+        assert_eq!(user_id_array.value(0), "123");
+
+        let score_array = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int32Array>()
+            .unwrap();
+        assert_eq!(score_array.value(0), 42);
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_table_with_extended_properties_without_columns_fails(
+        #[case] inline_optimization: bool,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_for_test(temp_path, inline_optimization).await;
+
+        let mut properties = std::collections::HashMap::new();
+        properties.insert(
+            "lance.manifest.extended.user_id".to_string(),
+            "123".to_string(),
+        );
+
+        let buffer = create_test_ipc_data();
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(properties);
+
+        let result = manifest_ns
+            .create_table(create_req, Bytes::from(buffer))
+            .await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Column user_id does not exist in extended properties"));
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_declare_table_with_extended_properties_without_columns_fails(
+        #[case] inline_optimization: bool,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_for_test(temp_path, inline_optimization).await;
+
+        let mut properties = std::collections::HashMap::new();
+        properties.insert(
+            "lance.manifest.extended.user_id".to_string(),
+            "123".to_string(),
+        );
+
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["test_table".to_string()]);
+        declare_req.properties = Some(properties);
+
+        let result = manifest_ns.declare_table(declare_req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Column user_id does not exist in extended properties"));
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_register_table_with_extended_properties_without_columns_fails(
+        #[case] inline_optimization: bool,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let manifest_ns = create_manifest_namespace_for_test(temp_path, inline_optimization).await;
+
+        let mut properties = std::collections::HashMap::new();
+        properties.insert(
+            "lance.manifest.extended.user_id".to_string(),
+            "123".to_string(),
+        );
+
+        let mut register_req = RegisterTableRequest::new("registered_table.lance".to_string());
+        register_req.id = Some(vec!["registered_table".to_string()]);
+        register_req.properties = Some(properties);
+
+        let result = LanceNamespace::register_table(&manifest_ns, register_req).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("Column user_id does not exist in extended properties"));
+    }
+
+    #[rstest]
+    #[case::with_optimization(true)]
+    #[case::without_optimization(false)]
+    #[tokio::test]
+    async fn test_create_table_extended_properties_null_and_empty_values_omitted(
+        #[case] inline_optimization: bool,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let mut manifest_ns =
+            create_manifest_namespace_for_test(temp_path, inline_optimization).await;
+        manifest_ns
+            .add_extended_properties(&vec![
+                ("lance.manifest.extended.null_prop", DataType::Utf8),
+                ("lance.manifest.extended.empty_prop", DataType::Utf8),
+                ("lance.manifest.extended.valid_prop", DataType::Utf8),
+                ("lance.manifest.extended.non_existed_prop", DataType::Utf8),
+            ])
+            .await
+            .unwrap();
+
+        let mut properties = std::collections::HashMap::new();
+        properties.insert("owner".to_string(), "alice".to_string());
+        properties.insert(
+            "lance.manifest.extended.null_prop".to_string(),
+            "null".to_string(),
+        );
+        properties.insert(
+            "lance.manifest.extended.empty_prop".to_string(),
+            "".to_string(),
+        );
+        properties.insert(
+            "lance.manifest.extended.valid_prop".to_string(),
+            "42".to_string(),
+        );
+
+        let buffer = create_test_ipc_data();
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["test_table".to_string()]);
+        create_req.properties = Some(properties);
+        manifest_ns
+            .create_table(create_req, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        let object_id = ManifestNamespace::build_object_id(&[], "test_table");
+
+        let mut scanner = manifest_ns.manifest_scanner().await.unwrap();
+        let filter = format!("object_id = '{}'", object_id);
+        scanner.filter(&filter).unwrap();
+        let batches = ManifestNamespace::execute_scanner(scanner).await.unwrap();
+
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 1);
+
+        let extended_props = manifest_ns.batch_to_extended_props(batch);
+
+        assert_eq!(
+            extended_props.get("lance.manifest.extended.valid_prop"),
+            Some(&"42".to_string())
+        );
+        assert!(!extended_props.contains_key("lance.manifest.extended.null_prop"));
+        assert!(!extended_props.contains_key("lance.manifest.extended.empty_prop"));
+        assert!(!extended_props.contains_key("lance.manifest.extended.non_existed_prop"));
+    }
+
+    #[tokio::test]
+    async fn test_describe_table_unifies_properties() {
+        let (_temp_dir, manifest_ns, base_properties) = prepare_properties_env().await;
+
+        // create_table scenario
+        let buffer = create_test_ipc_data();
+        let mut create_req = CreateTableRequest::new();
+        create_req.id = Some(vec!["created_table".to_string()]);
+        create_req.properties = Some(base_properties.clone());
+        manifest_ns
+            .create_table(create_req, Bytes::from(buffer))
+            .await
+            .unwrap();
+
+        verify_describe_table_props(&manifest_ns, "created_table", Some(true), &base_properties)
+            .await;
+        verify_describe_table_props(&manifest_ns, "created_table", Some(false), &base_properties)
+            .await;
+
+        // declare_table scenario
+        let mut declare_req = DeclareTableRequest::new();
+        declare_req.id = Some(vec!["declared_table".to_string()]);
+        declare_req.properties = Some(base_properties.clone());
+        manifest_ns.declare_table(declare_req).await.unwrap();
+
+        verify_describe_table_props(&manifest_ns, "declared_table", Some(true), &base_properties)
+            .await;
+        verify_describe_table_props(
+            &manifest_ns,
+            "declared_table",
+            Some(false),
+            &base_properties,
+        )
+        .await;
+
+        // register_table scenario
+        let mut register_req = RegisterTableRequest::new("registered_table.lance".to_string());
+        register_req.id = Some(vec!["registered_table".to_string()]);
+        register_req.properties = Some(base_properties.clone());
+        LanceNamespace::register_table(&manifest_ns, register_req)
+            .await
+            .unwrap();
+
+        verify_describe_table_props(
+            &manifest_ns,
+            "registered_table",
+            Some(true),
+            &base_properties,
+        )
+        .await;
+        verify_describe_table_props(
+            &manifest_ns,
+            "registered_table",
+            Some(false),
+            &base_properties,
+        )
+        .await;
+    }
+
+    async fn prepare_properties_env() -> (
+        TempStdDir,
+        ManifestNamespace,
+        std::collections::HashMap<String, String>,
+    ) {
+        let temp_dir = TempStdDir::default();
+        let temp_path = temp_dir.to_str().unwrap();
+        let mut manifest_ns = create_manifest_namespace_for_test(temp_path, true).await;
+        manifest_ns
+            .add_extended_properties(&vec![
+                ("lance.manifest.extended.user_id", DataType::Utf8),
+                ("lance.manifest.extended.score", DataType::Int32),
+            ])
+            .await
+            .unwrap();
+
+        // prepare base properties
+        let mut base_properties = std::collections::HashMap::new();
+        base_properties.insert("owner".to_string(), "alice".to_string());
+        base_properties.insert(
+            "lance.manifest.extended.user_id".to_string(),
+            "123".to_string(),
+        );
+        base_properties.insert(
+            "lance.manifest.extended.score".to_string(),
+            "42".to_string(),
+        );
+
+        (temp_dir, manifest_ns, base_properties)
+    }
+
+    async fn verify_describe_table_props(
+        manifest_ns: &ManifestNamespace,
+        table_name: &str,
+        load_detailed_metadata: Option<bool>,
+        base_properties: &std::collections::HashMap<String, String>,
+    ) {
+        let req = DescribeTableRequest {
+            id: Some(vec![table_name.to_string()]),
+            load_detailed_metadata,
+            ..Default::default()
+        };
+        let response = manifest_ns.describe_table(req).await.unwrap();
+        let props = response.properties.expect("properties should be present");
+        for (k, v) in base_properties.iter() {
+            assert_eq!(props.get(k), Some(v));
+        }
     }
 
     #[test]

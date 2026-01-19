@@ -2872,6 +2872,7 @@ mod tests {
                 mode: Some("create".to_string()),
                 identity: None,
                 context: None,
+                properties: None,
             };
             let result = namespace.create_table(create_table_req, table_data).await;
             assert!(result.is_ok(), "Failed to create table: {:?}", result);

@@ -3771,6 +3771,7 @@ dependencies = [
  "lance-index",
  "lance-io",
  "lance-namespace",
+ "lance-namespace-reqwest-client",
  "log",
  "object_store",
  "rand 0.9.2",
@@ -3787,8 +3788,7 @@ dependencies = [
 [[package]]
 name = "lance-namespace-reqwest-client"
 version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2acdba67f84190067532fce07b51a435dd390d7cdc1129a05003e5cb3274cf0"
+source = "git+https://github.com/wojiaodoubao/lance-namespace?branch=rest-table-properties#a122997e5ed74122686c3a4bd228b839d0d025eb"
 dependencies = [
  "reqwest",
  "serde",
