@@ -236,6 +236,12 @@ impl BlobPreprocessor {
                     Error::invalid_input("Blob struct missing `uri` field", location!())
                 })?
                 .as_string::<i32>();
+            let position_col = struct_arr
+                .column_by_name("position")
+                .map(|col| col.as_primitive::<UInt64Type>());
+            let blob_size_col = struct_arr
+                .column_by_name("blob_size")
+                .map(|col| col.as_primitive::<UInt64Type>());
 
             let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
             let mut uri_builder = StringBuilder::with_capacity(struct_arr.len(), 0);
@@ -262,6 +268,14 @@ impl BlobPreprocessor {
 
                 let has_data = !data_col.is_null(i);
                 let has_uri = !uri_col.is_null(i);
+                let has_position = position_col
+                    .as_ref()
+                    .map(|col| !col.is_null(i))
+                    .unwrap_or(false);
+                let has_blob_size = blob_size_col
+                    .as_ref()
+                    .map(|col| !col.is_null(i))
+                    .unwrap_or(false);
                 let data_len = if has_data { data_col.value(i).len() } else { 0 };
 
                 let dedicated_threshold = self.dedicated_thresholds[idx];
@@ -286,6 +300,26 @@ impl BlobPreprocessor {
                     uri_builder.append_null();
                     blob_id_builder.append_value(pack_blob_id);
                     blob_size_builder.append_value(data_len as u64);
+                    position_builder.append_value(position);
+                    continue;
+                }
+
+                if has_uri && has_position && has_blob_size {
+                    let uri_val = uri_col.value(i);
+                    let position = position_col
+                        .as_ref()
+                        .expect("position column must exist when has_position is true")
+                        .value(i);
+                    let blob_size = blob_size_col
+                        .as_ref()
+                        .expect("blob_size column must exist when has_blob_size is true")
+                        .value(i);
+
+                    kind_builder.append_value(BlobKind::ExternalPacked as u8);
+                    data_builder.append_null();
+                    uri_builder.append_value(uri_val);
+                    blob_id_builder.append_null();
+                    blob_size_builder.append_value(blob_size);
                     position_builder.append_value(position);
                     continue;
                 }
@@ -480,6 +514,26 @@ impl BlobFile {
             position: 0,
             size,
             kind: BlobKind::External,
+            uri: Some(uri),
+            reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
+        })
+    }
+
+    pub async fn new_external_packed(
+        uri: String,
+        position: u64,
+        size: u64,
+        registry: Arc<ObjectStoreRegistry>,
+        params: Arc<ObjectStoreParams>,
+    ) -> Result<Self> {
+        let (object_store, path) =
+            ObjectStore::from_uri_and_params(registry, &uri, &params).await?;
+        Ok(Self {
+            object_store,
+            path,
+            position,
+            size,
+            kind: BlobKind::ExternalPacked,
             uri: Some(uri),
             reader: Arc::new(Mutex::new(ReaderState::Uninitialized(0))),
         })
@@ -828,6 +882,20 @@ async fn collect_blob_files_v2(
                     .map(|p| Arc::new((**p).clone()))
                     .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
                 files.push(BlobFile::new_external(uri, size, registry, params).await?);
+            }
+            BlobKind::ExternalPacked => {
+                let uri = blob_uris.value(idx).to_string();
+                let position = positions.value(idx);
+                let size = sizes.value(idx);
+                let registry = dataset.session.store_registry();
+                let params = dataset
+                    .store_params
+                    .as_ref()
+                    .map(|p| Arc::new((**p).clone()))
+                    .unwrap_or_else(|| Arc::new(ObjectStoreParams::default()));
+                files.push(
+                    BlobFile::new_external_packed(uri, position, size, registry, params).await?,
+                );
             }
         }
     }
