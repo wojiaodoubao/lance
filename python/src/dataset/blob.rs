@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use pyo3::{
     exceptions::PyValueError,
@@ -54,6 +54,44 @@ impl LanceBlobFile {
 
     pub fn size(&self) -> u64 {
         self.inner.size()
+    }
+
+    #[pyo3(signature = (expires_in_seconds=None))]
+    pub fn https_url_and_range(
+        &self,
+        py: Python<'_>,
+        expires_in_seconds: Option<u64>,
+    ) -> PyResult<Option<(String, (u64, u64))>> {
+        let inner = self.inner.clone();
+        let expires = expires_in_seconds.map(Duration::from_secs);
+        rt().block_on(Some(py), inner.https_url_and_range(expires))?
+            .infer_error()
+    }
+
+    #[pyo3(signature = (expires_in_seconds=3600))]
+    pub fn signed_url(
+        &self,
+        py: Python<'_>,
+        expires_in_seconds: u64,
+    ) -> PyResult<Option<(String, (u64, u64))>> {
+        let inner = self.inner.clone();
+        rt().block_on(
+            Some(py),
+            inner.signed_url(Duration::from_secs(expires_in_seconds)),
+        )?
+        .infer_error()
+    }
+
+    #[pyo3(signature = ())]
+    pub fn public_url(&self, py: Python<'_>) -> PyResult<Option<(String, (u64, u64))>> {
+        let inner = self.inner.clone();
+        rt().block_on(Some(py), inner.public_url())?.infer_error()
+    }
+
+    #[pyo3(signature = ())]
+    pub fn object_url(&self, py: Python<'_>) -> PyResult<(String, (u64, u64))> {
+        let inner = self.inner.clone();
+        rt().block_on(Some(py), inner.object_url())?.infer_error()
     }
 
     pub fn readall<'a>(&'a self, py: Python<'a>) -> PyResult<Bound<'a, PyBytes>> {

@@ -47,6 +47,7 @@ tracing.workspace = true
 url.workspace = true
 path_abs.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true

@@ -11,6 +11,7 @@ use opendal::{services::Huggingface, Operator};
 use snafu::location;
 use url::Url;
 
+use crate::object_store::object_url::SimpleObjectUrl;
 use crate::object_store::parse_hf_repo_id;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
@@ -104,9 +105,14 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
 
         let inner: Arc<dyn OSObjectStore> = Arc::new(OpendalStore::new(operator));
 
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let url_provider = Arc::new(SimpleObjectUrl::new("hf".to_string()));
+
         Ok(ObjectStore {
             scheme: "hf".to_string(),
             inner,
+            url_provider,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -114,8 +120,7 @@ impl ObjectStoreProvider for HuggingfaceStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            store_prefix,
         })
     }
 

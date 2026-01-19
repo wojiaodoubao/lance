@@ -1,9 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import os
+import uuid
+
 import lance
 import pyarrow as pa
 import pytest
+import requests
 from lance import BlobColumn
 
 
@@ -332,3 +336,63 @@ def test_blob_extension_write_external(tmp_path):
     assert blob.size() == 5
     with blob as f:
         assert f.read() == b"hello"
+
+
+def test_blob_https_url_and_range_s3_roundtrip() -> None:
+    """End-to-end test for blob https_url_and_range on S3.
+    The test writes a single blob v2 row to an S3-backed dataset, obtains a
+    presigned URL and byte range via the inner LanceBlobFile, and then issues
+    a ranged HTTP GET to verify the returned bytes match the original blob
+    content.
+    """
+    endpoint = os.environ.get("LANCE_S3_ENDPOINT")
+    bucket = os.environ.get("LANCE_S3_BUCKET")
+    region = os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION")
+    if not endpoint or not bucket:
+        pytest.skip(
+            "LANCE_S3_ENDPOINT and LANCE_S3_BUCKET must be set for S3 blob URL test"
+        )
+
+    # Build storage options
+    storage_options: dict[str, str] = {
+        "aws_endpoint": endpoint,
+    }
+    if region:
+        storage_options["aws_region"] = region
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+    session_token = os.environ.get("AWS_SESSION_TOKEN")
+    if access_key and secret_key:
+        storage_options["aws_access_key_id"] = access_key
+        storage_options["aws_secret_access_key"] = secret_key
+        if session_token:
+            storage_options["aws_session_token"] = session_token
+    storage_options["virtual_hosted_style_request"] = "true"
+
+    uri = f"s3://{bucket}/blobv2-url-test/{uuid.uuid4().hex}"
+    data = b"hello-blob-v2-s3"
+    table = pa.table({"blob": lance.blob_array([data])})
+
+    ds = lance.write_dataset(
+        table,
+        uri,
+        data_storage_version="2.2",
+        storage_options=storage_options,
+    )
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+
+    # Use the inner LanceBlobFile to access https_url_and_range directly.
+    inner = blobs[0].inner
+    url, blob_range = inner.https_url_and_range(expires_in_seconds=3600)
+
+    assert isinstance(url, str)
+    assert url
+    assert blob_range is not None
+    offset, length = blob_range
+    assert length == len(data)
+    assert offset >= 0
+    headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
+    resp = requests.get(url, headers=headers)
+    resp.raise_for_status()
+    assert resp.content == data

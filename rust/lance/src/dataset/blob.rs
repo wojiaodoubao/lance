@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright The Lance Authors
 
-use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc};
+use std::{collections::HashMap, future::Future, ops::DerefMut, sync::Arc, time::Duration};
 
 use arrow::array::AsArray;
 use arrow::datatypes::{UInt32Type, UInt64Type, UInt8Type};
@@ -610,6 +610,53 @@ impl BlobFile {
     pub fn uri(&self) -> Option<&str> {
         self.uri.as_deref()
     }
+
+    /// Generate a https object URL and byte range for this blob.
+    ///
+    /// The returned URL points at the underlying object in the dataset's
+    /// object store. The optional `(offset, length)` pair describes the
+    /// blob payload in bytes inside that object.
+    ///
+    /// If `expires` is `None`, a public object URL is returned. When it is
+    /// `Some(duration)`, backends that support pre-signed URLs may return
+    /// a URL that expires after the given duration. If the backend cannot
+    /// provide a URL, this returns `Ok(None)`.
+    pub async fn https_url_and_range(
+        &self,
+        expires: Option<Duration>,
+    ) -> Result<Option<(String, (u64, u64))>> {
+        let url_opt = if let Some(expires) = expires {
+            self.object_store.signed_url(&self.path, expires).await?
+        } else {
+            self.object_store.public_url(&self.path)?
+        };
+        Ok(url_opt.map(|url| (url.to_string(), self.range())))
+    }
+
+    /// Generate a signed URL for this blob's underlying object.
+    pub async fn signed_url(&self, expires: Duration) -> Result<Option<(String, (u64, u64))>> {
+        let url_opt = self.object_store.signed_url(&self.path, expires).await?;
+        Ok(url_opt.map(|url| (url.to_string(), self.range())))
+    }
+
+    /// Generate a publicly accessible URL for this blob's underlying object.
+    pub async fn public_url(&self) -> Result<Option<(String, (u64, u64))>> {
+        let url_opt = self.object_store.public_url(&self.path)?;
+        Ok(url_opt.map(|url| (url.to_string(), self.range())))
+    }
+
+    /// Generate a stable object URL derived from the store prefix and path.
+    pub async fn object_url(&self) -> Result<(String, (u64, u64))> {
+        let url = self.object_store.object_url(&self.path)?;
+        Ok((url.to_string(), self.range()))
+    }
+
+    fn range(&self) -> (u64, u64) {
+        match self.kind {
+            BlobKind::Inline | BlobKind::Packed => (self.position, self.size),
+            BlobKind::Dedicated | BlobKind::External => (0, self.size),
+        }
+    }
 }
 
 pub(super) async fn take_blobs(
@@ -842,7 +889,7 @@ fn data_file_key_from_path(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Duration};
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
@@ -1122,6 +1169,40 @@ mod tests {
         assert_eq!(data_file_key_from_path("data/abc.lance"), "abc");
         assert_eq!(data_file_key_from_path("abc.lance"), "abc");
         assert_eq!(data_file_key_from_path("nested/path/xyz"), "xyz");
+    }
+
+    #[tokio::test]
+    async fn test_blob_urls() {
+        let fixture = BlobTestFixture::new().await;
+
+        let row_ids = fixture
+            .dataset
+            .scan()
+            .project::<String>(&[])
+            .unwrap()
+            .with_row_id()
+            .try_into_batch()
+            .await
+            .unwrap();
+        let row_ids = row_ids.column(0).as_primitive::<UInt64Type>().values();
+        let row_ids = vec![row_ids[0]];
+
+        let blobs = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
+        let blob = blobs.first().unwrap();
+
+        assert!(blob.https_url_and_range(None).await.unwrap().is_none());
+        assert!(blob
+            .signed_url(Duration::from_secs(60))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(blob.public_url().await.unwrap().is_none());
+
+        let (url, (offset, length)) = blob.object_url().await.unwrap();
+        assert!(!url.is_empty());
+        assert!(url.starts_with("file://"));
+        assert_eq!(offset, blob.position());
+        assert_eq!(length, blob.size());
     }
 
     #[tokio::test]

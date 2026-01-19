@@ -33,6 +33,7 @@ use url::Url;
 
 use super::local::LocalObjectReader;
 mod list_retry;
+pub mod object_url;
 pub mod providers;
 pub mod storage_options;
 mod tracing;
@@ -114,6 +115,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
+    /// Provider for generating signed, public, and object URLs.
+    url_provider: Arc<dyn object_url::ObjectUrl>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -335,7 +338,7 @@ pub fn uri_to_url(uri: &str) -> Result<Url> {
     }
 }
 
-fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
+pub fn expand_path(str_path: impl AsRef<str>) -> Result<std::path::PathBuf> {
     let expanded = tilde(str_path.as_ref()).to_string();
 
     let mut expanded_path = path_abs::PathAbs::new(expanded)
@@ -437,9 +440,14 @@ impl ObjectStore {
             let io_tracker = IOTracker::default();
             let tracked_store = io_tracker.wrap("", inner);
 
+            let scheme = path.scheme().to_string();
+            let url_provider: Arc<dyn object_url::ObjectUrl> =
+                Arc::new(object_url::SimpleObjectUrl::new(scheme.clone()));
+
             let store = Self {
                 inner: tracked_store,
-                scheme: path.scheme().to_string(),
+                url_provider,
+                scheme,
                 block_size: params.block_size.unwrap_or(64 * 1024),
                 max_iop_size: *DEFAULT_MAX_IOP_SIZE,
                 use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -764,6 +772,21 @@ impl ObjectStore {
         let reader = self.open(path).await?;
         Ok(reader.get_range(range).await?)
     }
+
+    /// Generate a pre-signed URL for an object at the given path.
+    pub async fn signed_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
+        self.url_provider.signed_url(path, expires).await
+    }
+
+    /// Generate a publicly accessible URL for an object, where supported.
+    pub fn public_url(&self, path: &Path) -> Result<Option<Url>> {
+        self.url_provider.public_url(path)
+    }
+
+    /// Generate a stable object URL derived from the store prefix and path.
+    pub fn object_url(&self, path: &Path) -> Result<Url> {
+        self.url_provider.object_url(path)
+    }
 }
 
 /// Options that can be set for multiple object stores
@@ -901,9 +924,14 @@ impl ObjectStore {
         let io_tracker = IOTracker::default();
         let tracked_store = io_tracker.wrap("", store);
 
+        let scheme_str = scheme.to_string();
+        let url_provider: Arc<dyn object_url::ObjectUrl> =
+            Arc::new(object_url::SimpleObjectUrl::new(scheme_str.clone()));
+
         Self {
             inner: tracked_store,
-            scheme: scheme.into(),
+            url_provider,
+            scheme: scheme_str,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts,
@@ -1303,6 +1331,48 @@ mod tests {
         assert!(dest_file.exists());
         let copied_content = std::fs::read(&dest_file).unwrap();
         assert_eq!(copied_content, b"test content");
+    }
+
+    #[tokio::test]
+    async fn test_file_urls() {
+        let tmp_dir = TempStdDir::default();
+        let lance_path = tmp_dir.join("foo.lance");
+        let file_path = lance_path.join("test_file");
+        write_to_file(file_path.to_str().unwrap(), "SIGNED_URL").unwrap();
+
+        let uri = lance_path.to_str().unwrap();
+        let (store, base) = ObjectStore::from_uri(uri).await.unwrap();
+        let path = base.child("test_file");
+
+        let signed = store
+            .signed_url(&path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        let public = store.public_url(&path).unwrap();
+        let object = store.object_url(&path).unwrap();
+
+        assert!(signed.is_none());
+        assert!(public.is_none());
+        assert_eq!(object.scheme(), "file");
+        assert!(object.as_str().starts_with("file://"));
+    }
+
+    #[tokio::test]
+    async fn test_memory_urls() {
+        let store = ObjectStore::memory();
+        let path = Path::from("path/to/file");
+
+        let object_url = store.object_url(&path).unwrap();
+        assert_eq!(object_url.as_str(), "memory:///path/to/file");
+
+        let public_url = store.public_url(&path).unwrap();
+        assert!(public_url.is_none());
+
+        let signed_url = store
+            .signed_url(&path, Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert!(signed_url.is_none());
     }
 
     #[tokio::test]

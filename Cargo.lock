@@ -5156,6 +5156,7 @@ dependencies = [
  "pprof",
  "prost",
  "rand 0.9.2",
+ "reqwest",
  "rstest 0.23.0",
  "serde",
  "shellexpand",
