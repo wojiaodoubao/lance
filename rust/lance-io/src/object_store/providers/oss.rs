@@ -9,6 +9,7 @@ use opendal::{services::Oss, Operator};
 use snafu::location;
 use url::Url;
 
+use crate::object_store::object_url::SimpleObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -97,9 +98,13 @@ impl ObjectStoreProvider for OssStoreProvider {
             url.set_path(&format!("{}/", url.path()));
         }
 
+        let store_prefix = self.calculate_object_store_prefix(&url, params.storage_options())?;
+        let url_provider = Arc::new(SimpleObjectUrl::new("oss".to_string()));
+
         Ok(ObjectStore {
             scheme: "oss".to_string(),
             inner: opendal_store,
+            url_provider,
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
             use_constant_size_upload_parts: params.use_constant_size_upload_parts,
@@ -107,7 +112,7 @@ impl ObjectStoreProvider for OssStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count: storage_options.download_retry_count(),
             io_tracker: Default::default(),
-            store_prefix: self.calculate_object_store_prefix(&url, params.storage_options())?,
+            store_prefix,
         })
     }
 }

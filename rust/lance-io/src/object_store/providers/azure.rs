@@ -14,11 +14,12 @@ use opendal::{services::Azblob, Operator};
 use snafu::location;
 
 use object_store::{
-    azure::{AzureConfigKey, MicrosoftAzureBuilder},
+    azure::{AzureConfigKey, MicrosoftAzure, MicrosoftAzureBuilder},
     RetryConfig,
 };
 use url::Url;
 
+use crate::object_store::object_url::SimpleObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -70,7 +71,7 @@ impl AzureBlobStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<MicrosoftAzure>> {
         let max_retries = storage_options.client_max_retries();
         let retry_timeout = storage_options.client_retry_timeout();
         let retry_config = RetryConfig {
@@ -86,7 +87,7 @@ impl AzureBlobStoreProvider {
             builder = builder.with_config(key, value);
         }
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 }
 
@@ -109,12 +110,19 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             self.build_opendal_azure_store(&base_path, &storage_options)
                 .await?
         } else {
-            self.build_microsoft_azure_store(&base_path, &storage_options)
-                .await?
+            let azure = self
+                .build_microsoft_azure_store(&base_path, &storage_options)
+                .await?;
+            azure as Arc<dyn OSObjectStore>
         };
+
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let url_provider = Arc::new(SimpleObjectUrl::new("az".to_string()));
 
         Ok(ObjectStore {
             inner,
+            url_provider,
             scheme: String::from("az"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -123,8 +131,7 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            store_prefix,
         })
     }
 

@@ -246,6 +246,94 @@ class BlobFile(io.RawIOBase):
         """
         return self.inner.size()
 
+    def https_url_and_range(
+        self, expires_in_seconds: int = 3600
+    ) -> Optional[tuple[str, tuple[int, int]]]:
+        """Return a https URL and byte range for this blob.
+
+        Parameters
+        ----------
+        expires_in_seconds:
+            If ``None``, returns a public URL. If a positive integer,
+            backends that support pre-signed URLs may return a URL that
+            expires after the given number of seconds.
+
+        Returns
+        -------
+        url:
+            The public URL (or pre-signed URL) for this blob.
+        range:
+            A ``(offset, length)`` pair in bytes describing where the blob
+            payload is located inside the underlying object.
+
+        Notes
+        -----
+        If the underlying store does not provide a usable URL for this blob,
+        this method returns ``None``.
+        """
+        return self.inner.https_url_and_range(expires_in_seconds)
+
+    def signed_url(
+        self, expires_in_seconds: int = 3600
+    ) -> Optional[tuple[str, tuple[int, int]]]:
+        """Return a pre-signed URL and byte range for this blob.
+
+        Parameters
+        ----------
+        expires_in_seconds:
+            The expires duration in seconds of the URL.
+
+        Returns
+        -------
+        url:
+            The pre-signed URL for this blob.
+        range:
+            A ``(offset, length)`` pair in bytes describing where the blob
+            payload is located inside the underlying object.
+
+        Notes
+        -----
+        If the backend does not support pre-signed URLs for this blob, this
+        method returns ``None``.
+        """
+        return self.inner.signed_url(expires_in_seconds)
+
+    def public_url(self) -> Optional[tuple[str, tuple[int, int]]]:
+        """Return a public URL and byte range for this blob.
+
+        Returns
+        -------
+        url:
+            The public URL for this blob.
+        range:
+            A ``(offset, length)`` pair in bytes describing where the blob
+            payload is located inside the underlying object.
+
+        Notes
+        -----
+        If the backend does not expose a public URL for this blob, this method
+        returns ``None``.
+        """
+        return self.inner.public_url()
+
+    def object_url(self) -> tuple[str, tuple[int, int]]:
+        """Return an object URL and byte range for this blob.
+
+        Returns
+        -------
+        url:
+            The object URL for this blob.
+        range:
+            A ``(offset, length)`` pair in bytes describing where the blob
+            payload is located inside the underlying object.
+
+        Notes
+        -----
+        Object URLs are derived from the store prefix and path and are
+        expected to be stable.
+        """
+        return self.inner.object_url()
+
     def readall(self) -> bytes:
         return self.inner.readall()
 

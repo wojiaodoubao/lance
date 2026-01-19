@@ -9,11 +9,12 @@ use opendal::{services::Gcs, Operator};
 use snafu::location;
 
 use object_store::{
-    gcp::{GcpCredential, GoogleCloudStorageBuilder, GoogleConfigKey},
+    gcp::{GcpCredential, GoogleCloudStorage, GoogleCloudStorageBuilder, GoogleConfigKey},
     RetryConfig, StaticCredentialProvider,
 };
 use url::Url;
 
+use crate::object_store::object_url::SimpleObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -63,7 +64,7 @@ impl GcsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<Arc<GoogleCloudStorage>> {
         let max_retries = storage_options.client_max_retries();
         let retry_timeout = storage_options.client_retry_timeout();
         let retry_config = RetryConfig {
@@ -87,7 +88,7 @@ impl GcsStoreProvider {
             builder = builder.with_credentials(credential_provider);
         }
 
-        Ok(Arc::new(builder.build()?) as Arc<dyn OSObjectStore>)
+        Ok(Arc::new(builder.build()?))
     }
 }
 
@@ -110,12 +111,19 @@ impl ObjectStoreProvider for GcsStoreProvider {
             self.build_opendal_gcs_store(&base_path, &storage_options)
                 .await?
         } else {
-            self.build_google_cloud_store(&base_path, &storage_options)
-                .await?
+            let gcs = self
+                .build_google_cloud_store(&base_path, &storage_options)
+                .await?;
+            gcs as Arc<dyn OSObjectStore>
         };
+
+        let store_prefix =
+            self.calculate_object_store_prefix(&base_path, params.storage_options())?;
+        let url_provider = Arc::new(SimpleObjectUrl::new("gs".to_string()));
 
         Ok(ObjectStore {
             inner,
+            url_provider,
             scheme: String::from("gs"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
@@ -124,8 +132,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
             io_parallelism: DEFAULT_CLOUD_IO_PARALLELISM,
             download_retry_count,
             io_tracker: Default::default(),
-            store_prefix: self
-                .calculate_object_store_prefix(&base_path, params.storage_options())?,
+            store_prefix,
         })
     }
 }

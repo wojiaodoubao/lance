@@ -3,6 +3,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::object_store::object_url::SimpleObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_MAX_IOP_SIZE,
@@ -23,6 +24,7 @@ impl ObjectStoreProvider for MemoryStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(InMemory::new()),
+            url_provider: Arc::new(SimpleObjectUrl::new("memory".to_string())),
             scheme: String::from("memory"),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
