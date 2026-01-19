@@ -15,17 +15,32 @@ class Blob:
     """
     A logical blob value for writing Lance blob columns.
 
-    A blob can be represented either by inlined bytes or by an external URI.
+    A blob can be represented as:
+    - inline bytes
+    - an external URI
+    - an external packed slice identified by (uri, position, size).
     """
 
     data: Optional[bytes] = None
     uri: Optional[str] = None
+    position: Optional[int] = None
+    size: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.data is not None and self.uri is not None:
             raise ValueError("Blob cannot have both data and uri")
         if self.uri == "":
             raise ValueError("Blob uri cannot be empty")
+        if (self.position is not None or self.size is not None) and self.uri is None:
+            raise ValueError("External packed blob must have a uri")
+        if (self.position is None) != (self.size is None):
+            raise ValueError(
+                "External packed blob must set both position and size, or neither"
+            )
+        if self.data is not None and self.position is not None:
+            raise ValueError(
+                "Blob cannot have both inline data and external slice metadata"
+            )
 
     @staticmethod
     def from_bytes(data: Union[bytes, bytearray, memoryview]) -> "Blob":
@@ -36,6 +51,16 @@ class Blob:
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
         return Blob(uri=uri)
+
+    @staticmethod
+    def from_external_packed(uri: str, position: int, size: int) -> "Blob":
+        if uri == "":
+            raise ValueError("Blob uri cannot be empty")
+        if position < 0 or size < 0:
+            raise ValueError(
+                "External packed blob position and size must be non-negative"
+            )
+        return Blob(uri=uri, position=position, size=size)
 
     @staticmethod
     def empty() -> "Blob":
@@ -55,6 +80,8 @@ class BlobType(pa.ExtensionType):
             [
                 pa.field("data", pa.large_binary(), nullable=True),
                 pa.field("uri", pa.utf8(), nullable=True),
+                pa.field("position", pa.uint64(), nullable=True),
+                pa.field("blob_size", pa.uint64(), nullable=True),
             ]
         )
         pa.ExtensionType.__init__(self, storage_type, "lance.blob.v2")
@@ -98,18 +125,24 @@ class BlobArray(pa.ExtensionArray):
     def from_pylist(cls, values: list[Any]) -> "BlobArray":
         data_values: list[Optional[bytes]] = []
         uri_values: list[Optional[str]] = []
+        position_values: list[Optional[int]] = []
+        size_values: list[Optional[int]] = []
         null_mask: list[bool] = []
 
         for v in values:
             if v is None:
                 data_values.append(None)
                 uri_values.append(None)
+                position_values.append(None)
+                size_values.append(None)
                 null_mask.append(True)
                 continue
 
             if isinstance(v, Blob):
                 data_values.append(v.data)
                 uri_values.append(v.uri)
+                position_values.append(v.position)
+                size_values.append(v.size)
                 null_mask.append(False)
                 continue
 
@@ -118,12 +151,16 @@ class BlobArray(pa.ExtensionArray):
                     raise ValueError("Blob uri cannot be empty")
                 data_values.append(None)
                 uri_values.append(v)
+                position_values.append(None)
+                size_values.append(None)
                 null_mask.append(False)
                 continue
 
             if isinstance(v, (bytes, bytearray, memoryview)):
                 data_values.append(bytes(v))
                 uri_values.append(None)
+                position_values.append(None)
+                size_values.append(None)
                 null_mask.append(False)
                 continue
 
@@ -134,9 +171,13 @@ class BlobArray(pa.ExtensionArray):
 
         data_arr = pa.array(data_values, type=pa.large_binary())
         uri_arr = pa.array(uri_values, type=pa.utf8())
+        position_arr = pa.array(position_values, type=pa.uint64())
+        size_arr = pa.array(size_values, type=pa.uint64())
         mask_arr = pa.array(null_mask, type=pa.bool_())
         storage = pa.StructArray.from_arrays(
-            [data_arr, uri_arr], names=["data", "uri"], mask=mask_arr
+            [data_arr, uri_arr, position_arr, size_arr],
+            names=["data", "uri", "position", "blob_size"],
+            mask=mask_arr,
         )
         return pa.ExtensionArray.from_storage(BlobType(), storage)  # type: ignore[return-value]
 
@@ -148,7 +189,8 @@ def blob_array(values: list[Any]) -> BlobArray:
     Each value must be one of:
     - bytes-like: inline bytes
     - str: an external URI
-    - Blob: explicit inline/uri/empty
+    - Blob: explicit inline/uri/empty, or an external packed slice via
+      :py:meth:`Blob.from_external_packed`
     - None: null
     """
 

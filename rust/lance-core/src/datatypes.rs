@@ -439,6 +439,9 @@ pub enum BlobKind {
     Dedicated = 2,
     /// Not stored by Lance; `blob_uri` holds an absolute external URI, offsets are zero.
     External = 3,
+    /// Stored inside an externally managed packed container; `blob_uri` identifies the container,
+    /// and `position`/`size` locate the slice within that container. `blob_id` is always zero.
+    ExternalPacked = 4,
 }
 
 impl TryFrom<u8> for BlobKind {
@@ -450,6 +453,7 @@ impl TryFrom<u8> for BlobKind {
             1 => Ok(Self::Packed),
             2 => Ok(Self::Dedicated),
             3 => Ok(Self::External),
+            4 => Ok(Self::ExternalPacked),
             other => Err(Error::InvalidInput {
                 source: format!("Unknown blob kind {other:?}").into(),
                 location: location!(),
