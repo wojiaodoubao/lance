@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import warnings
 from typing import Optional, Tuple
 
-from lance.dependencies import torch
-from lance.log import LOGGER
+# Suppress torch.jit.script deprecation warning in PyTorch 2.10+
+# TODO: migrate to torch.compile when feasible
+warnings.filterwarnings(
+    "ignore",
+    message=r".*torch\.jit\.script.*deprecated.*",
+    category=DeprecationWarning,
+)
+
+from lance.dependencies import torch  # noqa: E402
+from lance.log import LOGGER  # noqa: E402
 
 __all__ = [
     "pairwise_cosine",
@@ -15,7 +24,7 @@ __all__ = [
 ]
 
 
-@torch.compile
+@torch.jit.script
 def _pairwise_cosine(
     x: torch.Tensor, y: torch.Tensor, y2: torch.Tensor
 ) -> torch.Tensor:
@@ -48,7 +57,7 @@ def pairwise_cosine(
     return _pairwise_cosine(x, y, y2)
 
 
-@torch.compile
+@torch.jit.script
 def _cosine_distance(
     vectors: torch.Tensor, centroids: torch.Tensor, split_size: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -113,7 +122,7 @@ def cosine_distance(
     raise RuntimeError("Cosine distance out of memory")
 
 
-@torch.compile
+@torch.jit.script
 def argmin_l2(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     x = x.reshape(1, x.shape[0], -1)
     y = y.reshape(1, y.shape[0], -1)
@@ -124,7 +133,7 @@ def argmin_l2(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Ten
     return min_dists.pow(2), idx
 
 
-@torch.compile
+@torch.jit.script
 def pairwise_l2(
     x: torch.Tensor, y: torch.Tensor, y2: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
@@ -169,7 +178,7 @@ def pairwise_l2(
     return dists.type(origin_dtype)
 
 
-@torch.compile
+@torch.jit.script
 def _l2_distance(
     x: torch.Tensor,
     y: torch.Tensor,
@@ -236,7 +245,7 @@ def l2_distance(
     raise RuntimeError("L2 distance out of memory")
 
 
-@torch.compile
+@torch.jit.script
 def dot_distance(x: torch.Tensor, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """Pair-wise dot distance between two 2-D Tensors.
 
