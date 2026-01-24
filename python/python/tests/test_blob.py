@@ -337,7 +337,7 @@ def test_blob_extension_write_external(tmp_path):
         assert f.read() == b"hello"
 
 
-def test_blob_extension_write_external_packed_tar(tmp_path):
+def test_blob_extension_write_external_slice(tmp_path):
     tar_path = tmp_path / "container.tar"
     names = ["a.bin", "b.bin", "c.bin"]
     payloads = [b"alpha", b"bravo", b"charlie"]
@@ -361,8 +361,7 @@ def test_blob_extension_write_external_packed_tar(tmp_path):
     uri = tar_path.as_uri()
 
     blob_values = [
-        Blob.from_external_packed(uri, position, size)
-        for position, size in zip(positions, sizes)
+        Blob.from_uri(uri, position, size) for position, size in zip(positions, sizes)
     ]
 
     table = pa.table({"blob": lance.blob_array(blob_values)})

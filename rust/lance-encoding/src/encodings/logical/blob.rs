@@ -344,20 +344,20 @@ impl FieldEncoder for BlobV2StructuralEncoder {
                             blob_id_col.value(i),
                             "".to_string(),
                         ),
-                        BlobKind::External => (
-                            BlobKind::External as u8,
-                            0,
-                            0,
-                            0,
-                            uri_col.value(i).to_string(),
-                        ),
-                        BlobKind::ExternalPacked => (
-                            BlobKind::ExternalPacked as u8,
-                            packed_position_col.value(i),
-                            blob_size_col.value(i),
-                            0,
-                            uri_col.value(i).to_string(),
-                        ),
+                        BlobKind::External => {
+                            let uri = uri_col.value(i).to_string();
+                            let position = if packed_position_col.is_null(i) {
+                                0
+                            } else {
+                                packed_position_col.value(i)
+                            };
+                            let size = if blob_size_col.is_null(i) {
+                                0
+                            } else {
+                                blob_size_col.value(i)
+                            };
+                            (BlobKind::External as u8, position, size, 0, uri)
+                        }
                         BlobKind::Packed => (
                             BlobKind::Packed as u8,
                             packed_position_col.value(i),
@@ -675,7 +675,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blob_v2_external_packed_round_trip() {
+    async fn test_blob_v2_external_with_range_round_trip() {
         let blob_metadata =
             HashMap::from([(lance_arrow::BLOB_META_KEY.to_string(), "true".to_string())]);
 
@@ -686,7 +686,7 @@ mod tests {
         let blob_size_field = Arc::new(ArrowField::new("blob_size", DataType::UInt64, true));
         let position_field = Arc::new(ArrowField::new("position", DataType::UInt64, true));
 
-        let kind_array = UInt8Array::from(vec![BlobKind::ExternalPacked as u8]);
+        let kind_array = UInt8Array::from(vec![BlobKind::External as u8]);
         let data_array = LargeBinaryArray::from(vec![None::<&[u8]>]);
         let uri_array = StringArray::from(vec![Some("memory://container.pack")]);
         let blob_id_array = UInt32Array::from(vec![0]);
@@ -705,7 +705,7 @@ mod tests {
         let expected_descriptor = StructArray::from(vec![
             (
                 Arc::new(ArrowField::new("kind", DataType::UInt8, false)),
-                Arc::new(UInt8Array::from(vec![BlobKind::ExternalPacked as u8])) as ArrayRef,
+                Arc::new(UInt8Array::from(vec![BlobKind::External as u8])) as ArrayRef,
             ),
             (
                 Arc::new(ArrowField::new("position", DataType::UInt64, false)),

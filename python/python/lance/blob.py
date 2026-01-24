@@ -17,8 +17,8 @@ class Blob:
 
     A blob can be represented as:
     - inline bytes
-    - an external URI
-    - an external packed slice identified by (uri, position, size).
+    - an external URI with position and size, if position and size are not set,
+      use the full uri.
     """
 
     data: Optional[bytes] = None
@@ -35,7 +35,7 @@ class Blob:
             raise ValueError("External packed blob must have a uri")
         if (self.position is None) != (self.size is None):
             raise ValueError(
-                "External packed blob must set both position and size, or neither"
+                "External blob must set both position and size, or neither"
             )
         if self.data is not None and self.position is not None:
             raise ValueError(
@@ -47,13 +47,7 @@ class Blob:
         return Blob(data=bytes(data))
 
     @staticmethod
-    def from_uri(uri: str) -> "Blob":
-        if uri == "":
-            raise ValueError("Blob uri cannot be empty")
-        return Blob(uri=uri)
-
-    @staticmethod
-    def from_external_packed(uri: str, position: int, size: int) -> "Blob":
+    def from_uri(uri: str, position: int = None, size: int = None) -> "Blob":
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
         if position < 0 or size < 0:
@@ -189,8 +183,7 @@ def blob_array(values: list[Any]) -> BlobArray:
     Each value must be one of:
     - bytes-like: inline bytes
     - str: an external URI
-    - Blob: explicit inline/uri/empty, or an external packed slice via
-      :py:meth:`Blob.from_external_packed`
+    - Blob: explicit inline/uri/empty
     - None: null
     """
 
