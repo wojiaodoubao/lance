@@ -437,11 +437,11 @@ pub enum BlobKind {
     Packed = 1,
     /// Stored in a dedicated raw blob file; `blob_id` identifies the file, `size` is the full file length.
     Dedicated = 2,
-    /// Not stored by Lance; `blob_uri` holds an absolute external URI, offsets are zero.
+    /// Not stored by Lance; `blob_uri` holds an absolute external URI.
+    ///
+    /// If both `position` and `size` are non-zero, they describe a byte range within the
+    /// external object. If both are zero, the entire object is used.
     External = 3,
-    /// Stored inside an externally managed packed container; `blob_uri` identifies the container,
-    /// and `position`/`size` locate the slice within that container. `blob_id` is always zero.
-    ExternalPacked = 4,
 }
 
 impl TryFrom<u8> for BlobKind {
@@ -453,7 +453,6 @@ impl TryFrom<u8> for BlobKind {
             1 => Ok(Self::Packed),
             2 => Ok(Self::Dedicated),
             3 => Ok(Self::External),
-            4 => Ok(Self::ExternalPacked),
             other => Err(Error::InvalidInput {
                 source: format!("Unknown blob kind {other:?}").into(),
                 location: location!(),
