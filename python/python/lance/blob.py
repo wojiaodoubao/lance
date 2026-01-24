@@ -246,7 +246,7 @@ class BlobFile(io.RawIOBase):
         """
         return self.inner.size()
 
-    def https_url_and_range(
+    def http_url_and_range(
         self, expires_in_seconds: int = 3600
     ) -> Optional[tuple[str, tuple[int, int]]]:
         """Return a https URL and byte range for this blob.
@@ -271,7 +271,7 @@ class BlobFile(io.RawIOBase):
         If the underlying store does not provide a usable URL for this blob,
         this method returns ``None``.
         """
-        return self.inner.https_url_and_range(expires_in_seconds)
+        return self.inner.http_url_and_range(expires_in_seconds)
 
     def signed_url(
         self, expires_in_seconds: int = 3600

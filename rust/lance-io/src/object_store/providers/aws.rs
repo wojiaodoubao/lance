@@ -96,7 +96,7 @@ impl AwsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<(Arc<dyn OSObjectStore>, Operator)> {
         let bucket = base_path
             .host_str()
             .ok_or_else(|| Error::invalid_input("S3 URL must contain bucket name", location!()))?
@@ -124,7 +124,8 @@ impl AwsStoreProvider {
             })?
             .finish();
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        let inner = Arc::new(OpendalStore::new(operator.clone())) as Arc<dyn OSObjectStore>;
+        Ok((inner, operator))
     }
 }
 
@@ -156,13 +157,12 @@ impl ObjectStoreProvider for AwsStoreProvider {
             .map(|endpoint| endpoint.contains("r2.cloudflarestorage.com"))
             .unwrap_or(false);
 
-        let (inner, signer) = if use_opendal {
+        let (inner, signer, opendal_operator) = if use_opendal {
             // Use OpenDAL implementation
-            (
-                self.build_opendal_s3_store(&base_path, &storage_options)
-                    .await?,
-                None,
-            )
+            let (inner, operator) = self
+                .build_opendal_s3_store(&base_path, &storage_options)
+                .await?;
+            (inner, None, Some(operator))
         } else {
             // Use default Amazon S3 implementation
             let s3 = self
@@ -171,6 +171,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
             (
                 s3.clone() as Arc<dyn OSObjectStore>,
                 Some(s3 as Arc<dyn object_store::signer::Signer>),
+                None,
             )
         };
 
@@ -186,6 +187,7 @@ impl ObjectStoreProvider for AwsStoreProvider {
                     bucket,
                     endpoint,
                     signer.clone(),
+                    opendal_operator,
                 )),
                 Err(_) => Arc::new(SimpleObjectUrl::new(store_prefix.clone())),
             };

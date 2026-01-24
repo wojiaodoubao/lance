@@ -10,6 +10,8 @@ use object_store::path::Path;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use object_store::signer::Signer;
 #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+use opendal::Operator;
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
 use reqwest::Method;
 use snafu::location;
 use url::Url;
@@ -21,6 +23,12 @@ type SignerRef = Arc<dyn Signer>;
 
 #[cfg(not(any(feature = "aws", feature = "azure", feature = "gcp")))]
 type SignerRef = ();
+
+#[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+type OperatorRef = Operator;
+
+#[cfg(not(any(feature = "aws", feature = "azure", feature = "gcp")))]
+type OperatorRef = ();
 
 /// Trait for generating URLs for objects in an object store. .
 #[async_trait]
@@ -50,6 +58,7 @@ pub struct S3ObjectUrl {
     bucket: String,
     endpoint: String,
     signer: Option<SignerRef>,
+    opendal_operator: Option<OperatorRef>,
 }
 
 impl S3ObjectUrl {
@@ -58,12 +67,14 @@ impl S3ObjectUrl {
         bucket: String,
         endpoint: String,
         signer: Option<SignerRef>,
+        opendal_operator: Option<OperatorRef>,
     ) -> Self {
         Self {
             store_prefix,
             bucket,
             endpoint,
             signer,
+            opendal_operator,
         }
     }
 }
@@ -71,23 +82,7 @@ impl S3ObjectUrl {
 #[async_trait]
 impl ObjectUrl for S3ObjectUrl {
     async fn signed_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
-        #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
-        {
-            if let Some(signer) = self.signer.as_ref() {
-                let url = signer
-                    .signed_url(Method::GET, path, expires)
-                    .await
-                    .map_err(Error::from)?;
-                return Ok(Some(url));
-            }
-            Ok(None)
-        }
-
-        #[cfg(not(any(feature = "aws", feature = "azure", feature = "gcp")))]
-        {
-            let _ = (path, expires, self.signer);
-            Ok(None)
-        }
+        presigned_url(&self.signer, &self.opendal_operator, path, expires).await
     }
 
     fn public_url(&self, path: &Path) -> Result<Option<Url>> {
@@ -104,6 +99,78 @@ impl ObjectUrl for S3ObjectUrl {
 
     fn object_url(&self, path: &Path) -> Result<Url> {
         object_url_from_store_prefix(&self.store_prefix, path)
+    }
+}
+
+#[derive(Debug)]
+pub struct AzureObjectUrl {
+    store_prefix: String,
+    signer: Option<SignerRef>,
+    opendal_operator: Option<OperatorRef>,
+}
+
+#[async_trait]
+impl ObjectUrl for AzureObjectUrl {
+    async fn signed_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
+        presigned_url(&self.signer, &self.opendal_operator, path, expires).await
+    }
+
+    fn public_url(&self, _path: &Path) -> Result<Option<Url>> {
+        Ok(None)
+    }
+
+    fn object_url(&self, path: &Path) -> Result<Url> {
+        object_url_from_store_prefix(&self.store_prefix, path)
+    }
+}
+
+impl AzureObjectUrl {
+    pub fn new(
+        store_prefix: String,
+        signer: Option<SignerRef>,
+        opendal_operator: Option<OperatorRef>,
+    ) -> Self {
+        Self {
+            store_prefix,
+            signer,
+            opendal_operator,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct GcpObjectUrl {
+    store_prefix: String,
+    signer: Option<SignerRef>,
+    opendal_operator: Option<OperatorRef>,
+}
+
+#[async_trait]
+impl ObjectUrl for GcpObjectUrl {
+    async fn signed_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
+        presigned_url(&self.signer, &self.opendal_operator, path, expires).await
+    }
+
+    fn public_url(&self, _path: &Path) -> Result<Option<Url>> {
+        Ok(None)
+    }
+
+    fn object_url(&self, path: &Path) -> Result<Url> {
+        object_url_from_store_prefix(&self.store_prefix, path)
+    }
+}
+
+impl GcpObjectUrl {
+    pub fn new(
+        store_prefix: String,
+        signer: Option<SignerRef>,
+        opendal_operator: Option<OperatorRef>,
+    ) -> Self {
+        Self {
+            store_prefix,
+            signer,
+            opendal_operator,
+        }
     }
 }
 
@@ -131,6 +198,47 @@ impl ObjectUrl for SimpleObjectUrl {
 
     fn object_url(&self, path: &Path) -> Result<Url> {
         object_url_from_store_prefix(&self.store_prefix, path)
+    }
+}
+
+async fn presigned_url(
+    signer: &Option<SignerRef>,
+    opendal_operator: &Option<OperatorRef>,
+    path: &Path,
+    expires: Duration,
+) -> Result<Option<Url>> {
+    #[cfg(any(feature = "aws", feature = "azure", feature = "gcp"))]
+    {
+        if let Some(signer) = signer.as_ref() {
+            let url = signer
+                .signed_url(Method::GET, path, expires)
+                .await
+                .map_err(Error::from)?;
+            return Ok(Some(url));
+        }
+        if let Some(operator) = opendal_operator.as_ref() {
+            let request = operator
+                .presign_read(path.as_ref(), expires)
+                .await
+                .map_err(|e| {
+                    Error::invalid_input(
+                        format!("Failed to presign read request: {}", e),
+                        location!(),
+                    )
+                })?;
+            let uri = request.uri().to_string();
+            let url = Url::parse(&uri).map_err(|e| {
+                Error::invalid_input(format!("Invalid presigned URL {}: {}", uri, e), location!())
+            })?;
+            return Ok(Some(url));
+        }
+        Ok(None)
+    }
+
+    #[cfg(not(any(feature = "aws", feature = "azure", feature = "gcp")))]
+    {
+        let _ = (path, expires, signer, opendal_operator);
+        Ok(None)
     }
 }
 

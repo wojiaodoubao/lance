@@ -14,7 +14,7 @@ use object_store::{
 };
 use url::Url;
 
-use crate::object_store::object_url::SimpleObjectUrl;
+use crate::object_store::object_url::GcpObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -29,7 +29,7 @@ impl GcsStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<(Arc<dyn OSObjectStore>, Operator)> {
         let bucket = base_path
             .host_str()
             .ok_or_else(|| Error::invalid_input("GCS URL must contain bucket name", location!()))?
@@ -57,7 +57,8 @@ impl GcsStoreProvider {
             })?
             .finish();
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        let inner = Arc::new(OpendalStore::new(operator.clone())) as Arc<dyn OSObjectStore>;
+        Ok((inner, operator))
     }
 
     async fn build_google_cloud_store(
@@ -107,19 +108,29 @@ impl ObjectStoreProvider for GcsStoreProvider {
             .map(|v| v.as_str() == "true")
             .unwrap_or(false);
 
-        let inner = if use_opendal {
-            self.build_opendal_gcs_store(&base_path, &storage_options)
-                .await?
+        let (inner, signer, opendal_operator) = if use_opendal {
+            let (inner, operator) = self
+                .build_opendal_gcs_store(&base_path, &storage_options)
+                .await?;
+            (inner, None, Some(operator))
         } else {
             let gcs = self
                 .build_google_cloud_store(&base_path, &storage_options)
                 .await?;
-            gcs as Arc<dyn OSObjectStore>
+            (
+                gcs.clone() as Arc<dyn OSObjectStore>,
+                Some(gcs as Arc<dyn object_store::signer::Signer>),
+                None,
+            )
         };
 
         let store_prefix =
             self.calculate_object_store_prefix(&base_path, params.storage_options())?;
-        let url_provider = Arc::new(SimpleObjectUrl::new("gs".to_string()));
+        let url_provider = Arc::new(GcpObjectUrl::new(
+            store_prefix.clone(),
+            signer,
+            opendal_operator,
+        ));
 
         Ok(ObjectStore {
             inner,

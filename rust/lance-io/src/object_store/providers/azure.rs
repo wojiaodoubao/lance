@@ -19,7 +19,7 @@ use object_store::{
 };
 use url::Url;
 
-use crate::object_store::object_url::SimpleObjectUrl;
+use crate::object_store::object_url::AzureObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -34,7 +34,7 @@ impl AzureBlobStoreProvider {
         &self,
         base_path: &Url,
         storage_options: &StorageOptions,
-    ) -> Result<Arc<dyn OSObjectStore>> {
+    ) -> Result<(Arc<dyn OSObjectStore>, Operator)> {
         let container = base_path
             .host_str()
             .ok_or_else(|| {
@@ -64,7 +64,8 @@ impl AzureBlobStoreProvider {
             })?
             .finish();
 
-        Ok(Arc::new(OpendalStore::new(operator)) as Arc<dyn OSObjectStore>)
+        let inner = Arc::new(OpendalStore::new(operator.clone())) as Arc<dyn OSObjectStore>;
+        Ok((inner, operator))
     }
 
     async fn build_microsoft_azure_store(
@@ -106,19 +107,29 @@ impl ObjectStoreProvider for AzureBlobStoreProvider {
             .map(|v| v.as_str() == "true")
             .unwrap_or(false);
 
-        let inner = if use_opendal {
-            self.build_opendal_azure_store(&base_path, &storage_options)
-                .await?
+        let (inner, signer, opendal_operator) = if use_opendal {
+            let (inner, operator) = self
+                .build_opendal_azure_store(&base_path, &storage_options)
+                .await?;
+            (inner, None, Some(operator))
         } else {
             let azure = self
                 .build_microsoft_azure_store(&base_path, &storage_options)
                 .await?;
-            azure as Arc<dyn OSObjectStore>
+            (
+                azure.clone() as Arc<dyn OSObjectStore>,
+                Some(azure as Arc<dyn object_store::signer::Signer>),
+                None,
+            )
         };
 
         let store_prefix =
             self.calculate_object_store_prefix(&base_path, params.storage_options())?;
-        let url_provider = Arc::new(SimpleObjectUrl::new("az".to_string()));
+        let url_provider = Arc::new(AzureObjectUrl::new(
+            store_prefix.clone(),
+            signer,
+            opendal_operator,
+        ));
 
         Ok(ObjectStore {
             inner,

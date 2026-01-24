@@ -57,14 +57,14 @@ impl LanceBlobFile {
     }
 
     #[pyo3(signature = (expires_in_seconds=None))]
-    pub fn https_url_and_range(
+    pub fn http_url_and_range(
         &self,
         py: Python<'_>,
         expires_in_seconds: Option<u64>,
     ) -> PyResult<Option<(String, (u64, u64))>> {
         let inner = self.inner.clone();
         let expires = expires_in_seconds.map(Duration::from_secs);
-        rt().block_on(Some(py), inner.https_url_and_range(expires))?
+        rt().block_on(Some(py), inner.http_url_and_range(expires))?
             .infer_error()
     }
 
