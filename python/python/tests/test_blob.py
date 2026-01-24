@@ -338,8 +338,8 @@ def test_blob_extension_write_external(tmp_path):
         assert f.read() == b"hello"
 
 
-def test_blob_https_url_and_range_s3_roundtrip() -> None:
-    """End-to-end test for blob https_url_and_range on S3.
+def test_blob_http_url_and_range_s3_roundtrip() -> None:
+    """End-to-end test for blob http_url_and_range on S3.
     The test writes a single blob v2 row to an S3-backed dataset, obtains a
     presigned URL and byte range via the inner LanceBlobFile, and then issues
     a ranged HTTP GET to verify the returned bytes match the original blob
@@ -382,9 +382,9 @@ def test_blob_https_url_and_range_s3_roundtrip() -> None:
     blobs = ds.take_blobs("blob", indices=[0])
     assert len(blobs) == 1
 
-    # Use the inner LanceBlobFile to access https_url_and_range directly.
+    # Use the inner LanceBlobFile to access http_url_and_range directly.
     inner = blobs[0].inner
-    url, blob_range = inner.https_url_and_range(expires_in_seconds=3600)
+    url, blob_range = inner.http_url_and_range(expires_in_seconds=3600)
 
     assert isinstance(url, str)
     assert url

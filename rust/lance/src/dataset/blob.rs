@@ -611,7 +611,7 @@ impl BlobFile {
         self.uri.as_deref()
     }
 
-    /// Generate a https object URL and byte range for this blob.
+    /// Generate a http object URL and byte range for this blob.
     ///
     /// The returned URL points at the underlying object in the dataset's
     /// object store. The optional `(offset, length)` pair describes the
@@ -621,7 +621,7 @@ impl BlobFile {
     /// `Some(duration)`, backends that support pre-signed URLs may return
     /// a URL that expires after the given duration. If the backend cannot
     /// provide a URL, this returns `Ok(None)`.
-    pub async fn https_url_and_range(
+    pub async fn http_url_and_range(
         &self,
         expires: Option<Duration>,
     ) -> Result<Option<(String, (u64, u64))>> {
@@ -1172,7 +1172,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_blob_urls() {
+    async fn test_blob_urls_file_store() {
         let fixture = BlobTestFixture::new().await;
 
         let row_ids = fixture
@@ -1190,7 +1190,7 @@ mod tests {
         let blobs = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
         let blob = blobs.first().unwrap();
 
-        assert!(blob.https_url_and_range(None).await.unwrap().is_none());
+        assert!(blob.http_url_and_range(None).await.unwrap().is_none());
         assert!(blob
             .signed_url(Duration::from_secs(60))
             .await
