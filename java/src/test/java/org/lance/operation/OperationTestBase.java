@@ -62,14 +62,17 @@ public class OperationTestBase {
   }
 
   /**
-   * Helper method to create a DataFile from a VectorSchemaRoot. This implementation uses
-   * LanceFileWriter to ensure compatibility with Lance format.
+   * Helper method to create a DataFile from a VectorSchemaRoot.
+   *
+   * <p>This implementation uses LanceFileWriter to ensure compatibility with the Lance format. The
+   * {@code fieldIds} parameter contains Lance field ids from the dataset schema, and the {@code
+   * columnIndices} parameter contains the indices of the corresponding columns in the file.
    */
   protected DataFile writeLanceDataFile(
       BufferAllocator allocator,
       String basePath,
       VectorSchemaRoot root,
-      int[] fieldIndexes,
+      int[] fieldIds,
       int[] columnIndices) {
     // Create a unique file path for the data file
     String fileName = UUID.randomUUID() + ".lance";
@@ -85,14 +88,14 @@ public class OperationTestBase {
       throw new RuntimeException(e);
     }
 
-    // Create a DataFile object with the field index
-    // The fields array contains the indices of the fields in the schema
-    // The columnIndices array contains the indices of the columns in the file
-    // Use a stable file format version
+    // Create a DataFile object with field ids matching the dataset schema.
+    // The fields array contains Lance field ids in the schema.
+    // The columnIndices array contains the indices of the columns in the file.
+    // Use a stable file format version.
     return new DataFile(
         fileName,
-        fieldIndexes, // Field index in the schema
-        columnIndices, // Just the same with fieldIndex for easy test
+        fieldIds, // Lance field ids in the schema
+        columnIndices, // Column indices in the written file
         TEST_FILE_FORMAT_MAJOR_VERSION, // File major version
         TEST_FILE_FORMAT_MINOR_VERSION, // File minor version
         file.length(), // File size in bytes (now contains actual data)

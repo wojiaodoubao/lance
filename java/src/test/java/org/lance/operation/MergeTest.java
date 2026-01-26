@@ -19,8 +19,11 @@ import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
+import org.lance.schema.LanceField;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
@@ -43,25 +46,41 @@ public class MergeTest extends OperationTestBase {
   @Test
   void testMergeNewColumn(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testMergeNewColumn").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+    RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    try {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
 
       int rowCount = 15;
-      try (Dataset initialDataset = createAndAppendRows(testDataset, 15)) {
+      try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
         // Add a new column with different data type
         Field ageField = Field.nullable("age", new ArrowType.Int(32, true));
-        Schema evolvedSchema =
-            new Schema(
-                Arrays.asList(
-                    Field.nullable("id", new ArrowType.Int(32, true)),
-                    Field.nullable("name", new ArrowType.Utf8()),
-                    ageField),
-                null);
+
+        // New lance schema
+        LanceSchema baseSchema = initialDataset.getLanceSchema();
+        LanceField idLanceField = findField(baseSchema, "id");
+        LanceField nameLanceField = findField(baseSchema, "name");
+
+        int ageFieldId = initialDataset.maxFieldId() + 1;
+        LanceField ageLanceField =
+            LanceField.builder()
+                .name("age")
+                .id(ageFieldId)
+                .parentId(-1)
+                .nullable(true)
+                .type(new ArrowType.Int(32, true))
+                .encoding(LanceField.Encoding.PLAIN)
+                .build();
+
+        LanceSchema evolvedSchema =
+            LanceSchema.builder()
+                .withFields(Arrays.asList(idLanceField, nameLanceField, ageLanceField))
+                .build();
 
         try (VectorSchemaRoot ageRoot =
             VectorSchemaRoot.create(
                 new Schema(Collections.singletonList(ageField), null), allocator)) {
+          // Write new fragment
           ageRoot.allocateNew();
           IntVector ageVector = (IntVector) ageRoot.getVector("age");
 
@@ -72,12 +91,7 @@ public class MergeTest extends OperationTestBase {
 
           DataFile ageDataFile =
               writeLanceDataFile(
-                  dataset.allocator(),
-                  datasetPath,
-                  ageRoot,
-                  new int[] {2},
-                  new int[] {0} // field index for age column
-                  );
+                  allocator, datasetPath, ageRoot, new int[] {ageFieldId}, new int[] {0});
 
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
           List<DataFile> dataFiles = fragmentMeta.getFiles();
@@ -103,7 +117,7 @@ public class MergeTest extends OperationTestBase {
           try (Dataset evolvedDataset = mergeTransaction.commit()) {
             Assertions.assertEquals(3, evolvedDataset.version());
             Assertions.assertEquals(rowCount, evolvedDataset.countRows());
-            Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
+            Assertions.assertEquals(evolvedSchema, evolvedDataset.getLanceSchema());
             Assertions.assertEquals(3, evolvedDataset.getSchema().getFields().size());
             // Verify merged data
             try (LanceScanner scanner = evolvedDataset.newScan()) {
@@ -126,29 +140,67 @@ public class MergeTest extends OperationTestBase {
           }
         }
       }
+    } finally {
+      allocator.close();
     }
   }
 
+  private static LanceField findField(LanceSchema schema, String name) {
+    for (LanceField field : schema.fields()) {
+      if (field.getName().equals(name)) {
+        return field;
+      }
+    }
+    throw new IllegalArgumentException("No such field: " + name);
+  }
+
+  // Replace column id data type, add new column age and remove column name.
   @Test
   void testReplaceAsDiffColumns(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testReplaceAsDiffColumns").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+    RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    try {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
 
       int rowCount = 15;
-      try (Dataset initialDataset = createAndAppendRows(testDataset, 15)) {
-        // Add a new column with different data type
-        Field ageField = Field.nullable("age", new ArrowType.Int(32, true));
-        Field idField = Field.notNullable("id", new ArrowType.Int(32, true));
-        List<Field> fields = Arrays.asList(idField, ageField);
-        Schema evolvedSchema = new Schema(fields, null);
+      try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
+        // Add a new column age
+        Field ageFieldArrow = Field.nullable("age", new ArrowType.Int(32, true));
+        // Update id with different data type
+        Field idFieldArrow = Field.notNullable("id", new ArrowType.Int(64, true));
 
+        // Compute new lance schema:
+        //  id   - type updated from int32 to int64
+        //  age  - new added column
+        //  name - column removed
+        LanceSchema baseSchema = initialDataset.getLanceSchema();
+        LanceField idLanceField =
+            LanceField.builder(findField(baseSchema, "id"))
+                .type(new ArrowType.Int(64, true))
+                .encoding(LanceField.Encoding.PLAIN)
+                .build();
+
+        int ageFieldId = initialDataset.maxFieldId() + 1;
+        LanceField ageLanceField =
+            LanceField.builder()
+                .name("age")
+                .id(ageFieldId)
+                .parentId(-1)
+                .nullable(true)
+                .type(new ArrowType.Int(32, true))
+                .encoding(LanceField.Encoding.PLAIN)
+                .build();
+        LanceSchema evolvedLanceSchema =
+            LanceSchema.builder().withFields(Arrays.asList(idLanceField, ageLanceField)).build();
+
+        List<Field> fields = Arrays.asList(idFieldArrow, ageFieldArrow);
         try (VectorSchemaRoot ageRoot =
             VectorSchemaRoot.create(new Schema(fields, null), allocator)) {
+          // Write new fragment with new id and age
           ageRoot.allocateNew();
           IntVector ageVector = (IntVector) ageRoot.getVector("age");
-          IntVector idVector = (IntVector) ageRoot.getVector("id");
+          BigIntVector idVector = (BigIntVector) ageRoot.getVector("id");
 
           for (int i = 0; i < rowCount; i++) {
             ageVector.setSafe(i, 20 + i);
@@ -158,7 +210,11 @@ public class MergeTest extends OperationTestBase {
 
           DataFile ageDataFile =
               writeLanceDataFile(
-                  dataset.allocator(), datasetPath, ageRoot, new int[] {0, 1}, new int[] {0, 1});
+                  allocator,
+                  datasetPath,
+                  ageRoot,
+                  new int[] {idLanceField.getId(), ageFieldId},
+                  new int[] {0, 1});
 
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
           FragmentMetadata evolvedFragment =
@@ -175,14 +231,14 @@ public class MergeTest extends OperationTestBase {
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
-                          .schema(evolvedSchema)
+                          .schema(evolvedLanceSchema)
                           .build())
                   .build();
 
           try (Dataset evolvedDataset = mergeTransaction.commit()) {
             Assertions.assertEquals(3, evolvedDataset.version());
             Assertions.assertEquals(rowCount, evolvedDataset.countRows());
-            Assertions.assertEquals(evolvedSchema, evolvedDataset.getSchema());
+            Assertions.assertEquals(evolvedLanceSchema, evolvedDataset.getLanceSchema());
             Assertions.assertEquals(2, evolvedDataset.getSchema().getFields().size());
             // Verify merged data
             try (LanceScanner scanner = evolvedDataset.newScan()) {
@@ -196,7 +252,8 @@ public class MergeTest extends OperationTestBase {
                 for (int i = 0; i < rowCount; i++) {
                   Assertions.assertEquals(20 + i, ageResultVector.get(i));
                 }
-                IntVector idResultVector = (IntVector) batch.getVector("id");
+                // Verify id column
+                BigIntVector idResultVector = (BigIntVector) batch.getVector("id");
                 for (int i = 0; i < rowCount; i++) {
                   Assertions.assertEquals(i, idResultVector.get(i));
                 }
@@ -205,22 +262,33 @@ public class MergeTest extends OperationTestBase {
           }
         }
       }
+    } finally {
+      allocator.close();
     }
   }
 
   @Test
   void testMergeExistingColumn(@TempDir Path tempDir) throws Exception {
     String datasetPath = tempDir.resolve("testMergeExistingColumn").toString();
-    try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
+    RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+    try {
       // Test merging with existing column updates
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
 
       int rowCount = 10;
       try (Dataset initialDataset = createAndAppendRows(testDataset, rowCount)) {
+        LanceSchema baseSchema = initialDataset.getLanceSchema();
+        LanceField idLanceField = findField(baseSchema, "id");
+        int newNameId = initialDataset.maxFieldId() + 1;
+        LanceField nameLanceField =
+            LanceField.builder(findField(baseSchema, "name")).id(newNameId).build();
+        LanceSchema evolvedSchema =
+            LanceSchema.builder().withFields(Arrays.asList(idLanceField, nameLanceField)).build();
+
         // Create updated name column data
-        Field nameField = Field.nullable("name", new ArrowType.Utf8());
-        Schema nameSchema = new Schema(Collections.singletonList(nameField), null);
+        Field nameFieldArrow = Field.nullable("name", new ArrowType.Utf8());
+        Schema nameSchema = new Schema(Collections.singletonList(nameFieldArrow), null);
 
         try (VectorSchemaRoot updatedNameRoot = VectorSchemaRoot.create(nameSchema, allocator)) {
           updatedNameRoot.allocateNew();
@@ -235,12 +303,11 @@ public class MergeTest extends OperationTestBase {
           // Create DataFile for updated column
           DataFile updatedNameDataFile =
               writeLanceDataFile(
-                  dataset.allocator(),
+                  allocator,
                   datasetPath,
                   updatedNameRoot,
-                  new int[] {1}, // field index for name column
-                  new int[] {0} // column indices
-                  );
+                  new int[] {nameLanceField.getId()},
+                  new int[] {0});
 
           // Perform merge with updated column
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
@@ -260,13 +327,14 @@ public class MergeTest extends OperationTestBase {
                   .operation(
                       Merge.builder()
                           .fragments(Collections.singletonList(evolvedFragment))
-                          .schema(testDataset.getSchema())
+                          .schema(evolvedSchema)
                           .build())
                   .build();
 
           try (Dataset mergedDataset = mergeTransaction.commit()) {
             Assertions.assertEquals(3, mergedDataset.version());
             Assertions.assertEquals(rowCount, mergedDataset.countRows());
+            Assertions.assertEquals(evolvedSchema, mergedDataset.getLanceSchema());
 
             // Verify updated data
             try (LanceScanner scanner = mergedDataset.newScan()) {
@@ -285,6 +353,8 @@ public class MergeTest extends OperationTestBase {
           }
         }
       }
+    } finally {
+      allocator.close();
     }
   }
 }

@@ -13,8 +13,9 @@
  */
 package org.lance.operation;
 
+import org.lance.schema.LanceSchema;
+
 import com.google.common.base.MoreObjects;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 /**
  * Project to a new schema. This Operation only changes the schema, not the data. Note: 1. For
@@ -22,7 +23,7 @@ import org.apache.arrow.vector.types.pojo.Schema;
  * positions, not ids(a.k.a. field id)
  */
 public class Project extends SchemaOperation {
-  private Project(Schema schema) {
+  private Project(LanceSchema schema) {
     super(schema);
   }
 
@@ -41,11 +42,11 @@ public class Project extends SchemaOperation {
   }
 
   public static class Builder {
-    private Schema schema;
+    private LanceSchema schema;
 
     public Builder() {}
 
-    public Builder schema(Schema schema) {
+    public Builder schema(LanceSchema schema) {
       this.schema = schema;
       return this;
     }

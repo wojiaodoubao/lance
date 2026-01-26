@@ -14,9 +14,9 @@
 package org.lance.operation;
 
 import org.lance.FragmentMetadata;
+import org.lance.schema.LanceSchema;
 
 import com.google.common.base.MoreObjects;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Map;
@@ -33,7 +33,9 @@ public class Overwrite extends SchemaOperation {
   private final Optional<Map<String, String>> configUpsertValues;
 
   protected Overwrite(
-      List<FragmentMetadata> fragments, Schema schema, Map<String, String> configUpsertValues) {
+      List<FragmentMetadata> fragments,
+      LanceSchema schema,
+      Map<String, String> configUpsertValues) {
     super(schema);
     this.fragments = fragments;
     this.configUpsertValues = Optional.ofNullable(configUpsertValues);
@@ -76,7 +78,7 @@ public class Overwrite extends SchemaOperation {
 
   public static class Builder {
     private List<FragmentMetadata> fragments;
-    private Schema schema;
+    private LanceSchema schema;
     private Map<String, String> configUpsertValues;
 
     private Builder() {}
@@ -86,7 +88,7 @@ public class Overwrite extends SchemaOperation {
       return this;
     }
 
-    public Builder schema(Schema schema) {
+    public Builder schema(LanceSchema schema) {
       this.schema = schema;
       return this;
     }

@@ -3,12 +3,11 @@
 
 use crate::blocking_dataset::{BlockingDataset, NATIVE_DATASET};
 use crate::error::Result;
+use crate::schema::convert_lance_schema_from_java;
 use crate::traits::{export_vec, import_vec_from_method, FromJObjectWithEnv, IntoJava, JLance};
 use crate::utils::{to_java_map, to_rust_map};
 use crate::Error;
 use crate::JNIEnvExt;
-use arrow::datatypes::Schema;
-use arrow_schema::ffi::FFI_ArrowSchema;
 use chrono::DateTime;
 use jni::objects::{JByteArray, JLongArray, JMap, JObject, JString, JValue, JValueGen};
 use jni::sys::jboolean;
@@ -378,15 +377,14 @@ fn convert_to_java_operation_inner<'local>(
             initial_bases: _,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
-            let java_schema = convert_to_java_schema(env, schema)?;
+            let java_schema = schema.into_java(env)?;
             let java_config = match config_upsert_values {
                 Some(config_upsert_values) => to_java_map(env, &config_upsert_values)?,
                 _ => JObject::null(),
             };
-
             Ok(env.new_object(
                 "org/lance/operation/Overwrite",
-                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;Ljava/util/Map;)V",
+                "(Ljava/util/List;Lorg/lance/schema/LanceSchema;Ljava/util/Map;)V",
                 &[
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
@@ -440,11 +438,11 @@ fn convert_to_java_operation_inner<'local>(
             )?)
         }
         Operation::Project { schema } => {
-            let java_schema = convert_to_java_schema(env, schema)?;
+            let java_schema = schema.into_java(env)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Project",
-                "(Lorg/apache/arrow/vector/types/pojo/Schema;)V",
+                "(Lorg/lance/schema/LanceSchema;)V",
                 &[JValue::Object(&java_schema)],
             )?)
         }
@@ -523,11 +521,11 @@ fn convert_to_java_operation_inner<'local>(
             schema,
         } => {
             let java_fragments = export_vec(env, &rust_fragments)?;
-            let java_schema = convert_to_java_schema(env, schema)?;
+            let java_schema = schema.into_java(env)?;
 
             Ok(env.new_object(
                 "org/lance/operation/Merge",
-                "(Ljava/util/List;Lorg/apache/arrow/vector/types/pojo/Schema;)V",
+                "(Ljava/util/List;Lorg/lance/schema/LanceSchema;)V",
                 &[
                     JValue::Object(&java_fragments),
                     JValue::Object(&java_schema),
@@ -546,21 +544,6 @@ fn convert_to_java_operation_inner<'local>(
         )?),
         _ => unimplemented!(),
     }
-}
-
-pub(crate) fn convert_to_java_schema<'local>(
-    env: &mut JNIEnv<'local>,
-    schema: LanceSchema,
-) -> Result<JObject<'local>> {
-    let java_schema = schema.into_java(env)?;
-    Ok(env
-        .call_method(
-            &java_schema,
-            "asArrowSchema",
-            "()Lorg/apache/arrow/vector/types/pojo/Schema;",
-            &[],
-        )?
-        .l()?)
 }
 
 #[no_mangle]
@@ -688,42 +671,27 @@ fn convert_to_rust_transaction(
 fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
-    java_dataset: &JObject,
 ) -> Result<LanceSchema> {
-    let java_buffer_allocator = env
+    let java_lance_schema = env
         .call_method(
-            java_dataset,
-            "allocator",
-            "()Lorg/apache/arrow/memory/BufferAllocator;",
+            java_operation,
+            "schema",
+            "()Lorg/lance/schema/LanceSchema;",
             &[],
         )?
         .l()?;
-    let schema_ptr = env
-        .call_method(
-            java_operation,
-            "exportSchema",
-            "(Lorg/apache/arrow/memory/BufferAllocator;)J",
-            &[JValue::Object(&java_buffer_allocator)],
-        )?
-        .j()?;
-    let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
-    let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let schema = Schema::try_from(&c_schema)?;
-    Ok(
-        LanceSchema::try_from(&schema)
-            .expect("Failed to convert from arrow schema to lance schema"),
-    )
+    convert_lance_schema_from_java(env, &java_lance_schema)
 }
 
 fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
-    java_dataset: Option<&JObject<'_>>,
+    _java_dataset: Option<&JObject<'_>>,
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
-            schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+            schema: convert_schema_from_operation(env, java_operation)?,
         },
         "UpdateConfig" => {
             let config_updates_obj = env
@@ -844,7 +812,7 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
-            let schema = convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?;
+            let schema = convert_schema_from_operation(env, java_operation)?;
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -938,7 +906,7 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
-                schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+                schema: convert_schema_from_operation(env, java_operation)?,
             }
         }
         "Restore" => {

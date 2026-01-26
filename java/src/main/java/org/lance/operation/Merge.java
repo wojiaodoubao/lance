@@ -14,9 +14,9 @@
 package org.lance.operation;
 
 import org.lance.FragmentMetadata;
+import org.lance.schema.LanceSchema;
 
 import com.google.common.base.MoreObjects;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.List;
 import java.util.Objects;
@@ -28,7 +28,7 @@ import java.util.Objects;
 public class Merge extends SchemaOperation {
   private final List<FragmentMetadata> fragments;
 
-  protected Merge(List<FragmentMetadata> fragments, Schema schema) {
+  protected Merge(List<FragmentMetadata> fragments, LanceSchema schema) {
     super(schema);
     this.fragments = fragments;
   }
@@ -70,7 +70,7 @@ public class Merge extends SchemaOperation {
 
   public static class Builder {
     private List<FragmentMetadata> fragments;
-    private Schema schema;
+    private LanceSchema schema;
 
     private Builder() {}
 
@@ -79,7 +79,7 @@ public class Merge extends SchemaOperation {
       return this;
     }
 
-    public Builder schema(Schema schema) {
+    public Builder schema(LanceSchema schema) {
       this.schema = schema;
       return this;
     }

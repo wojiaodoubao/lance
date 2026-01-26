@@ -19,13 +19,17 @@ import org.lance.FragmentMetadata;
 import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.ipc.LanceScanner;
+import org.lance.schema.LanceField;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -43,21 +47,44 @@ public class OverwriteTest extends OperationTestBase {
       // Commit fragment
       int rowCount = 20;
       FragmentMetadata fragmentMeta = testDataset.createNewFragment(rowCount);
+      LanceField idLanceField =
+          LanceField.builder()
+              .name("id")
+              .id(0)
+              .parentId(-1)
+              .nullable(true)
+              .type(new ArrowType.Int(32, true))
+              .encoding(LanceField.Encoding.PLAIN)
+              .build();
+      LanceField nameLanceField =
+          LanceField.builder()
+              .name("name")
+              .id(1)
+              .parentId(-1)
+              .nullable(true)
+              .type(ArrowType.Utf8.INSTANCE)
+              .encoding(LanceField.Encoding.PLAIN)
+              .build();
+      LanceSchema schema =
+          LanceSchema.builder().withFields(Arrays.asList(idLanceField, nameLanceField)).build();
+
       Transaction transaction =
           dataset
               .newTransactionBuilder()
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
-                      .schema(testDataset.getSchema())
+                      .schema(schema)
                       .build())
               .build();
+
       try (Dataset dataset = transaction.commit()) {
         assertEquals(2, dataset.version());
         assertEquals(2, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
-        Fragment fragment = dataset.getFragments().get(0);
+        assertEquals(schema, dataset.getLanceSchema());
 
+        Fragment fragment = dataset.getFragments().get(0);
         try (LanceScanner scanner = fragment.newScan()) {
           Schema schemaRes = scanner.schema();
           assertEquals(testDataset.getSchema(), schemaRes);
@@ -73,7 +100,7 @@ public class OverwriteTest extends OperationTestBase {
               .operation(
                   Overwrite.builder()
                       .fragments(Collections.singletonList(fragmentMeta))
-                      .schema(testDataset.getSchema())
+                      .schema(schema)
                       .configUpsertValues(Collections.singletonMap("config_key", "config_value"))
                       .build())
               .transactionProperties(Collections.singletonMap("key", "value"))
@@ -84,6 +111,7 @@ public class OverwriteTest extends OperationTestBase {
         assertEquals(3, dataset.version());
         assertEquals(3, dataset.latestVersion());
         assertEquals(rowCount, dataset.countRows());
+        assertEquals(schema, dataset.getLanceSchema());
         assertEquals("config_value", dataset.getConfig().get("config_key"));
         Fragment fragment = dataset.getFragments().get(0);
 

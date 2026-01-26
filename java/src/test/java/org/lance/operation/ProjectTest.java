@@ -16,10 +16,10 @@ package org.lance.operation;
 import org.lance.Dataset;
 import org.lance.TestUtils;
 import org.lance.Transaction;
+import org.lance.schema.LanceField;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.Schema;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -39,31 +39,36 @@ public class ProjectTest extends OperationTestBase {
       TestUtils.SimpleTestDataset testDataset =
           new TestUtils.SimpleTestDataset(allocator, datasetPath);
       dataset = testDataset.createEmptyDataset();
+      List<LanceField> newSchema1 = new ArrayList<>(dataset.getLanceSchema().fields());
+      Collections.reverse(newSchema1);
 
-      assertEquals(testDataset.getSchema(), dataset.getSchema());
-      List<Field> fieldList = new ArrayList<>(testDataset.getSchema().getFields());
-      Collections.reverse(fieldList);
+      // Build reversed LanceSchema from scratch: name then id
+      LanceSchema projectedSchema = LanceSchema.builder().withFields(newSchema1).build();
       Transaction txn1 =
           dataset
               .newTransactionBuilder()
-              .operation(Project.builder().schema(new Schema(fieldList)).build())
+              .operation(Project.builder().schema(projectedSchema).build())
               .build();
       try (Dataset committedDataset = txn1.commit()) {
         assertEquals(1, txn1.readVersion());
         assertEquals(1, dataset.version());
         assertEquals(2, committedDataset.version());
-        assertEquals(new Schema(fieldList), committedDataset.getSchema());
-        fieldList.remove(1);
+        assertEquals(projectedSchema, committedDataset.getLanceSchema());
+
+        // Remove one field and project again using a new LanceSchema
+        List<LanceField> newSchema2 = new ArrayList<>(committedDataset.getLanceSchema().fields());
+        newSchema2.remove(0);
+        LanceSchema projectedSchema2 = LanceSchema.builder().withFields(newSchema2).build();
         Transaction txn2 =
             committedDataset
                 .newTransactionBuilder()
-                .operation(Project.builder().schema(new Schema(fieldList)).build())
+                .operation(Project.builder().schema(projectedSchema2).build())
                 .build();
         try (Dataset committedDataset2 = txn2.commit()) {
           assertEquals(2, txn2.readVersion());
           assertEquals(2, committedDataset.version());
           assertEquals(3, committedDataset2.version());
-          assertEquals(new Schema(fieldList), committedDataset2.getSchema());
+          assertEquals(projectedSchema2, committedDataset2.getLanceSchema());
           assertEquals(txn1, committedDataset.readTransaction().orElse(null));
           assertEquals(txn2, committedDataset2.readTransaction().orElse(null));
         }

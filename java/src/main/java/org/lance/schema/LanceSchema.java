@@ -14,12 +14,11 @@
 package org.lance.schema;
 
 import com.google.common.base.MoreObjects;
-import org.apache.arrow.vector.types.pojo.Schema;
 
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
+import java.util.Objects;
 
 public class LanceSchema {
   private final List<LanceField> fields;
@@ -27,7 +26,7 @@ public class LanceSchema {
 
   LanceSchema(List<LanceField> fields, Map<String, String> metadata) {
     this.fields = fields;
-    this.metadata = metadata;
+    this.metadata = metadata != null ? metadata : Collections.emptyMap();
   }
 
   public List<LanceField> fields() {
@@ -38,9 +37,25 @@ public class LanceSchema {
     return Collections.unmodifiableMap(metadata);
   }
 
-  public Schema asArrowSchema() {
-    return new Schema(
-        fields.stream().map(LanceField::asArrowField).collect(Collectors.toList()), metadata);
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    LanceSchema that = (LanceSchema) o;
+    return Objects.equals(fields, that.fields) && Objects.equals(metadata, that.metadata);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(fields, metadata);
   }
 
   @Override
@@ -51,12 +66,12 @@ public class LanceSchema {
         .toString();
   }
 
-  // Builder class for LanceSchema
-  private static class Builder {
+  /** Builder for LanceSchema. */
+  public static class Builder {
     private List<LanceField> fields;
     private Map<String, String> metadata;
 
-    Builder() {}
+    public Builder() {}
 
     public Builder withFields(List<LanceField> fields) {
       this.fields = fields;
@@ -69,7 +84,11 @@ public class LanceSchema {
     }
 
     public LanceSchema build() {
-      return new LanceSchema(fields, metadata);
+      List<LanceField> resolvedFields =
+          fields == null ? Collections.emptyList() : Collections.unmodifiableList(fields);
+      Map<String, String> resolvedMetadata =
+          metadata == null ? Collections.emptyMap() : Collections.unmodifiableMap(metadata);
+      return new LanceSchema(resolvedFields, resolvedMetadata);
     }
   }
 }

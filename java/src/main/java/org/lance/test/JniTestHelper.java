@@ -16,6 +16,7 @@ package org.lance.test;
 import org.lance.JniLoader;
 import org.lance.index.IndexParams;
 import org.lance.ipc.Query;
+import org.lance.schema.LanceField;
 
 import java.util.List;
 import java.util.Optional;
@@ -58,4 +59,13 @@ public class JniTestHelper {
   public static native void parseQuery(Optional<Query> query);
 
   public static native void parseIndexParams(IndexParams indexParams);
+
+  /**
+   * JNI helper for LanceField round-trip conversion.
+   *
+   * <p>This is only intended for tests: it takes a Java LanceField, converts it to the
+   * corresponding Rust lance_core::datatypes::Field and back again, and returns the round-tripped
+   * LanceField so tests can assert fidelity of the conversion.
+   */
+  public static native LanceField roundTripLanceField(LanceField field);
 }

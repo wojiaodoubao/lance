@@ -3,19 +3,44 @@
 
 use crate::error::{Error, Result};
 use crate::traits::IntoJava;
-use crate::utils::to_java_map;
+use crate::utils::{to_java_map, to_rust_map};
+use crate::JNIEnvExt;
+use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
-use arrow_schema::{TimeUnit, UnionFields};
-use jni::objects::{JObject, JValue};
-use jni::sys::{jboolean, jint};
+use arrow::record_batch::RecordBatch;
+use arrow_ipc::reader::StreamReader;
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{Field as ArrowField, Schema as ArrowSchema, TimeUnit, UnionFields};
+use jni::objects::{JByteArray, JList, JMap, JObject, JValue};
+use jni::sys::{jboolean, jint, jlong};
 use jni::JNIEnv;
-use lance_core::datatypes::{Field, Schema};
+use lance_core::datatypes::{Dictionary, Encoding, Field, LogicalType, Schema};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+#[no_mangle]
+pub extern "system" fn Java_org_lance_test_JniTestHelper_roundTripLanceField<'local>(
+    mut env: JNIEnv<'local>,
+    _obj: JObject<'local>,
+    java_field: JObject<'local>,
+) -> JObject<'local> {
+    ok_or_throw!(env, inner_round_trip_lance_field(&mut env, java_field))
+}
+
+fn inner_round_trip_lance_field<'local>(
+    env: &mut JNIEnv<'local>,
+    java_field: JObject<'local>,
+) -> Result<JObject<'local>> {
+    let rust_field = convert_lance_field_from_java_field(env, &java_field)?;
+    let round_tripped = convert_lance_field_to_java_field(env, &rust_field)?;
+    Ok(round_tripped)
+}
 
 impl IntoJava for Schema {
     fn into_java<'local>(self, env: &mut JNIEnv<'local>) -> Result<JObject<'local>> {
         let jfield_list = env.new_object("java/util/ArrayList", "()V", &[])?;
         for lance_field in self.fields.iter() {
-            let java_field = convert_to_java_field(env, lance_field)?;
+            let java_field = convert_lance_field_to_java_field(env, lance_field)?;
             env.call_method(
                 &jfield_list,
                 "add",
@@ -32,22 +57,85 @@ impl IntoJava for Schema {
     }
 }
 
-pub fn convert_to_java_field<'local>(
+pub fn convert_lance_field_to_java_field<'local>(
     env: &mut JNIEnv<'local>,
     lance_field: &Field,
 ) -> Result<JObject<'local>> {
     let name = env.new_string(&lance_field.name)?;
     let children = convert_children_fields(env, lance_field)?;
     let metadata = to_java_map(env, &lance_field.metadata)?;
-    let logical_type = env.new_string(lance_field.logical_type.to_string())?;
     let arrow_type = convert_arrow_type(env, &lance_field.data_type())?;
     let ctor_sig = "(IILjava/lang/String;".to_owned()
-        + "ZLjava/lang/String;"
-        + "Lorg/apache/arrow/vector/types/pojo/ArrowType;"
-        + "Lorg/apache/arrow/vector/types/pojo/DictionaryEncoding;"
+        + "ZLorg/apache/arrow/vector/types/pojo/ArrowType;"
         + "Ljava/util/Map;"
-        + "Ljava/util/List;ZI)V";
+        + "Ljava/util/List;"
+        + "ZILorg/lance/schema/LanceField$Encoding;"
+        + "Lorg/lance/schema/LanceField$LanceDictionary;)V";
     let pk_position = lance_field.unenforced_primary_key_position.unwrap_or(0) as jint;
+
+    // Map Rust Encoding to Java LanceField.Encoding
+    let encoding_class = "org/lance/schema/LanceField$Encoding";
+    let jencoding = match &lance_field.encoding {
+        Some(Encoding::Plain) => Some(
+            env.get_static_field(
+                encoding_class,
+                "PLAIN",
+                "Lorg/lance/schema/LanceField$Encoding;",
+            )?
+            .l()?,
+        ),
+        Some(Encoding::VarBinary) => Some(
+            env.get_static_field(
+                encoding_class,
+                "VAR_BINARY",
+                "Lorg/lance/schema/LanceField$Encoding;",
+            )?
+            .l()?,
+        ),
+        Some(Encoding::Dictionary) => Some(
+            env.get_static_field(
+                encoding_class,
+                "DICTIONARY",
+                "Lorg/lance/schema/LanceField$Encoding;",
+            )?
+            .l()?,
+        ),
+        Some(Encoding::RLE) => Some(
+            env.get_static_field(
+                encoding_class,
+                "RLE",
+                "Lorg/lance/schema/LanceField$Encoding;",
+            )?
+            .l()?,
+        ),
+        None => None,
+    };
+
+    // Dictionary: map Rust Dictionary to Java LanceDictionary
+    let jdict = if let Some(dict) = &lance_field.dictionary {
+        let offset = dict.offset as jlong;
+        let length = dict.length as jlong;
+
+        let values_bytes = if let Some(values_arr) = &dict.values {
+            encode_dictionary_values(values_arr)?
+        } else {
+            Vec::new()
+        };
+
+        let jvalues: JByteArray = env.byte_array_from_slice(&values_bytes)?;
+        env.new_object(
+            "org/lance/schema/LanceField$LanceDictionary",
+            "(JJ[B)V",
+            &[
+                JValue::Long(offset),
+                JValue::Long(length),
+                JValue::Object(&jvalues),
+            ],
+        )?
+    } else {
+        JObject::null()
+    };
+
     let field_obj = env.new_object(
         "org/lance/schema/LanceField",
         ctor_sig.as_str(),
@@ -56,13 +144,13 @@ pub fn convert_to_java_field<'local>(
             JValue::Int(lance_field.parent_id as jint),
             JValue::Object(&JObject::from(name)),
             JValue::Bool(lance_field.nullable as jboolean),
-            JValue::Object(&JObject::from(logical_type)),
             JValue::Object(&arrow_type),
-            JValue::Object(&JObject::null()),
             JValue::Object(&metadata),
             JValue::Object(&children),
             JValue::Bool(lance_field.is_unenforced_primary_key() as jboolean),
             JValue::Int(pk_position),
+            JValue::Object(&jencoding.unwrap_or(JObject::null())),
+            JValue::Object(&jdict),
         ],
     )?;
 
@@ -75,7 +163,7 @@ fn convert_children_fields<'local>(
 ) -> Result<JObject<'local>> {
     let children_list = env.new_object("java/util/ArrayList", "()V", &[])?;
     for lance_field in lance_field.children.iter() {
-        let field = convert_to_java_field(env, lance_field)?;
+        let field = convert_lance_field_to_java_field(env, lance_field)?;
         env.call_method(
             &children_list,
             "add",
@@ -84,6 +172,352 @@ fn convert_children_fields<'local>(
         )?;
     }
     Ok(children_list)
+}
+
+/// Construct a Rust Field from a Java LanceField.
+pub fn convert_lance_field_from_java_field<'local>(
+    env: &mut JNIEnv<'local>,
+    java_field: &JObject<'local>,
+) -> Result<Field> {
+    // Basic attributes
+    let name = env.get_string_from_method(java_field, "getName")?;
+    let id = env.call_method(java_field, "getId", "()I", &[])?.i()?;
+    let parent_id = env
+        .call_method(java_field, "getParentId", "()I", &[])?
+        .i()?;
+    let nullable = env.call_method(java_field, "isNullable", "()Z", &[])?.z()?;
+
+    // Metadata Map<String, String>
+    let java_metadata = env
+        .call_method(java_field, "getMetadata", "()Ljava/util/Map;", &[])?
+        .l()?;
+
+    let metadata: HashMap<String, String> = if java_metadata.is_null() {
+        HashMap::new()
+    } else {
+        let jmap = JMap::from_env(env, &java_metadata)?;
+        to_rust_map(env, &jmap)?
+    };
+
+    // Child fields List<LanceField>
+    let java_children = env
+        .call_method(java_field, "getChildren", "()Ljava/util/List;", &[])?
+        .l()?;
+
+    let mut children = Vec::new();
+    if !java_children.is_null() {
+        let jlist: JList = env.get_list(&java_children)?;
+        let mut iter = jlist.iter(env)?;
+        children = Vec::with_capacity(jlist.size(env)? as usize);
+        while let Some(child_obj) = iter.next(env)? {
+            children.push(convert_lance_field_from_java_field(env, &child_obj)?);
+        }
+    }
+
+    // Derive LogicalType from the Java ArrowType via a Rust DataType,
+    // sharing the same mapping as LogicalType::try_from(&DataType).
+    let arrow_type_obj = env
+        .call_method(
+            java_field,
+            "getType",
+            "()Lorg/apache/arrow/vector/types/pojo/ArrowType;",
+            &[],
+        )?
+        .l()?;
+    let data_type = data_type_from_java_arrow_type(env, &arrow_type_obj, &children)?;
+    let logical_type = LogicalType::try_from(&data_type)?;
+
+    // Primary key information
+    let is_unenforced_pk = env
+        .call_method(java_field, "isUnenforcedPrimaryKey", "()Z", &[])?
+        .z()?;
+
+    let java_pk_pos = env
+        .call_method(
+            java_field,
+            "getUnenforcedPrimaryKeyPosition",
+            "()Ljava/util/OptionalInt;",
+            &[],
+        )?
+        .l()?;
+
+    let unenforced_primary_key_position = if java_pk_pos.is_null() {
+        if is_unenforced_pk {
+            Some(0)
+        } else {
+            None
+        }
+    } else {
+        let has_pos = env
+            .call_method(&java_pk_pos, "isPresent", "()Z", &[])?
+            .z()?;
+        if has_pos {
+            let pos = env.call_method(&java_pk_pos, "getAsInt", "()I", &[])?.i()?;
+            Some(pos as u32)
+        } else if is_unenforced_pk {
+            // When only the boolean PK flag is set, use 0 as a compatible sentinel position
+            Some(0)
+        } else {
+            None
+        }
+    };
+
+    // encoding: map LanceField.Encoding back to Rust Encoding
+    let encoding_optional = env
+        .call_method(java_field, "getEncoding", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    let encoding: Option<Encoding> = env.get_optional(&encoding_optional, |env, enc_obj| {
+        let name = env.get_string_from_method(&enc_obj, "name")?;
+        match name.as_str() {
+            "PLAIN" => Ok(Encoding::Plain),
+            "VAR_BINARY" => Ok(Encoding::VarBinary),
+            "DICTIONARY" => Ok(Encoding::Dictionary),
+            "RLE" => Ok(Encoding::RLE),
+            other => Err(Error::input_error(format!(
+                "Unknown LanceField.Encoding value: {}",
+                other
+            ))),
+        }
+    })?;
+
+    // Dictionary: fully reconstruct offset/length/values via LanceDictionary
+    let dict_optional = env
+        .call_method(java_field, "getDictionary", "()Ljava/util/Optional;", &[])?
+        .l()?;
+
+    let dictionary: Option<Dictionary> = env.get_optional(&dict_optional, |env, dict_obj| {
+        let offset = env.call_method(&dict_obj, "getOffset", "()J", &[])?.j()? as usize;
+        let length = env.call_method(&dict_obj, "getLength", "()J", &[])?.j()? as usize;
+
+        let values_obj = env.call_method(&dict_obj, "getValues", "()[B", &[])?.l()?;
+
+        let values = if values_obj.is_null() {
+            None
+        } else {
+            let jbytes = JByteArray::from(values_obj);
+            let bytes = env.convert_byte_array(&jbytes)?;
+            Some(decode_dictionary_values(&bytes)?)
+        };
+
+        Ok(Dictionary {
+            offset,
+            length,
+            values,
+        })
+    })?;
+
+    Ok(Field {
+        name,
+        id,
+        parent_id,
+        logical_type,
+        metadata,
+        encoding,
+        nullable,
+        children,
+        dictionary,
+        unenforced_primary_key_position,
+    })
+}
+
+/// Derive a Rust `DataType` from Java `ArrowType`.
+fn data_type_from_java_arrow_type(
+    env: &mut JNIEnv,
+    arrow_type: &JObject,
+    children: &[Field],
+) -> Result<DataType> {
+    // Int
+    let int_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$Int")?;
+    if env.is_instance_of(arrow_type, int_class)? {
+        let bit_width = env
+            .call_method(arrow_type, "getBitWidth", "()I", &[])?
+            .i()?;
+        let is_signed = env
+            .call_method(arrow_type, "getIsSigned", "()Z", &[])?
+            .z()?;
+
+        let ty = match (bit_width, is_signed) {
+            (8, true) => DataType::Int8,
+            (8, false) => DataType::UInt8,
+            (16, true) => DataType::Int16,
+            (16, false) => DataType::UInt16,
+            (32, true) => DataType::Int32,
+            (32, false) => DataType::UInt32,
+            (64, true) => DataType::Int64,
+            (64, false) => DataType::UInt64,
+            _ => {
+                return Err(Error::input_error(format!(
+                    "Unsupported Arrow Int type: bit_width={}, signed={}",
+                    bit_width, is_signed
+                )))
+            }
+        };
+        return Ok(ty);
+    }
+
+    // Floating point
+    let fp_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$FloatingPoint")?;
+    if env.is_instance_of(arrow_type, fp_class)? {
+        let precision_obj = env
+            .call_method(
+                arrow_type,
+                "getPrecision",
+                "()Lorg/apache/arrow/vector/types/FloatingPointPrecision;",
+                &[],
+            )?
+            .l()?;
+        let precision_str = env.get_string_from_method(&precision_obj, "name")?;
+        let ty = match precision_str.as_str() {
+            "HALF" => DataType::Float16,
+            "SINGLE" => DataType::Float32,
+            "DOUBLE" => DataType::Float64,
+            other => {
+                return Err(Error::input_error(format!(
+                    "Unsupported FloatingPoint precision: {}",
+                    other
+                )))
+            }
+        };
+        return Ok(ty);
+    }
+
+    // Utf8 / LargeUtf8 / Binary / LargeBinary
+    let utf8_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$Utf8")?;
+    if env.is_instance_of(arrow_type, utf8_class)? {
+        return Ok(DataType::Utf8);
+    }
+
+    let large_utf8_class =
+        env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$LargeUtf8")?;
+    if env.is_instance_of(arrow_type, large_utf8_class)? {
+        return Ok(DataType::LargeUtf8);
+    }
+
+    let binary_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$Binary")?;
+    if env.is_instance_of(arrow_type, binary_class)? {
+        return Ok(DataType::Binary);
+    }
+
+    let large_binary_class =
+        env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$LargeBinary")?;
+    if env.is_instance_of(arrow_type, large_binary_class)? {
+        return Ok(DataType::LargeBinary);
+    }
+
+    // List.
+    let list_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$List")?;
+    if env.is_instance_of(arrow_type, list_class)? {
+        let elem_field = if let Some(child) = children.first() {
+            ArrowField::from(child)
+        } else {
+            ArrowField::new("item", DataType::Null, true)
+        };
+        return Ok(DataType::List(Arc::new(elem_field)));
+    }
+
+    // LargeList.
+    let large_list_class =
+        env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$LargeList")?;
+    if env.is_instance_of(arrow_type, large_list_class)? {
+        let elem_field = if let Some(child) = children.first() {
+            ArrowField::from(child)
+        } else {
+            ArrowField::new("item", DataType::Null, true)
+        };
+        return Ok(DataType::LargeList(Arc::new(elem_field)));
+    }
+
+    // Struct.
+    let struct_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$Struct")?;
+    if env.is_instance_of(arrow_type, struct_class)? {
+        let struct_fields: Vec<ArrowField> =
+            children.iter().map(ArrowField::from).collect();
+        return Ok(DataType::Struct(struct_fields.into()));
+    }
+
+    Err(Error::input_error(
+        "Unsupported ArrowType for LogicalType conversion in JNI schema".to_string(),
+    ))
+}
+
+/// Construct a Rust Schema from a Java LanceSchema.
+pub fn convert_lance_schema_from_java<'local>(
+    env: &mut JNIEnv<'local>,
+    java_schema: &JObject<'local>,
+) -> Result<Schema> {
+    // Top-level fields List<LanceField>
+    let java_fields_list = env
+        .call_method(java_schema, "fields", "()Ljava/util/List;", &[])?
+        .l()?;
+
+    let jlist: JList = env.get_list(&java_fields_list)?;
+    let mut iter = jlist.iter(env)?;
+    let mut fields = Vec::with_capacity(jlist.size(env)? as usize);
+    while let Some(field_obj) = iter.next(env)? {
+        let field = convert_lance_field_from_java_field(env, &field_obj)?;
+        fields.push(field);
+    }
+
+    // Schema metadata Map<String, String>
+    let java_metadata = env
+        .call_method(java_schema, "metadata", "()Ljava/util/Map;", &[])?
+        .l()?;
+
+    let metadata = if java_metadata.is_null() {
+        HashMap::new()
+    } else {
+        let jmap = JMap::from_env(env, &java_metadata)?;
+        to_rust_map(env, &jmap)?
+    };
+
+    Ok(Schema { fields, metadata })
+}
+
+fn encode_dictionary_values(values: &ArrayRef) -> Result<Vec<u8>> {
+    use std::sync::Arc;
+
+    let field = ArrowField::new("value", values.data_type().clone(), true);
+    let schema = ArrowSchema::new(vec![field]);
+    let batch = RecordBatch::try_new(Arc::new(schema), vec![values.clone()])
+        .map_err(|e| Error::input_error(format!("Failed to build dictionary batch: {e}")))?;
+
+    let mut buf = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).map_err(|e| {
+            Error::input_error(format!("Failed to create dictionary StreamWriter: {e}",))
+        })?;
+        writer
+            .write(&batch)
+            .map_err(|e| Error::input_error(format!("Failed to write dictionary batch: {e}",)))?;
+        writer
+            .finish()
+            .map_err(|e| Error::input_error(format!("Failed to finish dictionary stream: {e}",)))?;
+    }
+    Ok(buf)
+}
+
+fn decode_dictionary_values(bytes: &[u8]) -> Result<ArrayRef> {
+    use std::io::Cursor;
+
+    let cursor = Cursor::new(bytes);
+    let mut reader = StreamReader::try_new(cursor, None).map_err(|e| {
+        Error::input_error(format!("Failed to create dictionary StreamReader: {e}",))
+    })?;
+    let batch = reader
+        .next()
+        .transpose()
+        .map_err(|e| Error::input_error(format!("Failed to read dictionary batch: {e}",)))?
+        .ok_or_else(|| Error::input_error("Empty dictionary IPC stream".to_string()))?;
+
+    if batch.num_columns() != 1 {
+        return Err(Error::input_error(format!(
+            "Dictionary batch expected 1 column, got {}",
+            batch.num_columns()
+        )));
+    }
+
+    Ok(batch.column(0).clone())
 }
 
 pub fn convert_arrow_type<'local>(

@@ -1174,6 +1174,19 @@ fn inner_get_lance_schema<'local>(
 }
 
 #[no_mangle]
+pub extern "system" fn Java_org_lance_Dataset_nativeGetMaxFieldId(
+    mut env: JNIEnv,
+    java_dataset: JObject,
+) -> jint {
+    ok_or_throw_with_return!(env, inner_get_max_field_id(&mut env, java_dataset), -1) as jint
+}
+fn inner_get_max_field_id(env: &mut JNIEnv, java_dataset: JObject) -> Result<i32> {
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    Ok(dataset_guard.inner.manifest().max_field_id())
+}
+
+#[no_mangle]
 pub extern "system" fn Java_org_lance_Dataset_importFfiSchema(
     mut env: JNIEnv,
     jdataset: JObject,

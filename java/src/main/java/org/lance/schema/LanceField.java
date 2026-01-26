@@ -14,59 +14,125 @@
 package org.lance.schema;
 
 import com.google.common.base.MoreObjects;
-import com.google.common.collect.ImmutableMap;
-import org.apache.arrow.vector.types.DateUnit;
-import org.apache.arrow.vector.types.FloatingPointPrecision;
-import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.types.pojo.ArrowType;
-import org.apache.arrow.vector.types.pojo.DictionaryEncoding;
-import org.apache.arrow.vector.types.pojo.Field;
-import org.apache.arrow.vector.types.pojo.FieldType;
 
-import java.util.Arrays;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.OptionalInt;
-import java.util.stream.Collectors;
 
 public class LanceField {
+  /**
+   * Logical encoding of the field's values. Mirrors lance_core::datatypes::field::Encoding on the
+   * Rust side.
+   */
+  public enum Encoding {
+    PLAIN,
+    VAR_BINARY,
+    DICTIONARY,
+    RLE
+  }
+
+  /**
+   * Dictionary descriptor for this field. Mirrors lance_core::datatypes::Dictionary, but uses an
+   * IPC-encoded Arrow array for the values.
+   */
+  public static class LanceDictionary {
+    private final long offset;
+    private final long length;
+    private final byte[] values;
+
+    public LanceDictionary(long offset, long length, byte[] values) {
+      this.offset = offset;
+      this.length = length;
+      this.values = values;
+    }
+
+    public long getOffset() {
+      return offset;
+    }
+
+    public long getLength() {
+      return length;
+    }
+
+    public byte[] getValues() {
+      return values;
+    }
+
+    @Override
+    public int hashCode() {
+      return Objects.hash(offset, length, values);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+      if (this == o) {
+        return true;
+      }
+      if (o == null || getClass() != o.getClass()) {
+        return false;
+      }
+      LanceDictionary that = (LanceDictionary) o;
+      if (offset != that.offset
+          || length != that.length
+          || (values == null && that.values != null)
+          || (values != null && that.values == null)) {
+        return false;
+      }
+      if (values != null) {
+        return Objects.equals(decodeDictionaryValues(values), decodeDictionaryValues(that.values));
+      }
+      return true;
+    }
+  }
+
   private final int id;
   private final int parentId;
   private final String name;
   private final boolean nullable;
-  private final String logicalType;
   private final ArrowType type;
-  private final DictionaryEncoding dictionaryEncoding;
   private final Map<String, String> metadata;
   private final List<LanceField> children;
   private final boolean isUnenforcedPrimaryKey;
   private final int unenforcedPrimaryKeyPosition;
+  private final Encoding encoding;
+  private final LanceDictionary dictionary;
 
   LanceField(
       int id,
       int parentId,
       String name,
       boolean nullable,
-      String logicalType,
       ArrowType type,
-      DictionaryEncoding dictionaryEncoding,
       Map<String, String> metadata,
       List<LanceField> children,
       boolean isUnenforcedPrimaryKey,
-      int unenforcedPrimaryKeyPosition) {
+      int unenforcedPrimaryKeyPosition,
+      Encoding encoding,
+      LanceDictionary dictionary) {
     this.id = id;
     this.parentId = parentId;
     this.name = name;
     this.nullable = nullable;
-    this.logicalType = logicalType;
     this.type = type;
-    this.dictionaryEncoding = dictionaryEncoding;
-    this.metadata = metadata;
-    this.children = children;
+    this.metadata = metadata != null ? metadata : Collections.emptyMap();
+    this.children = children != null ? children : Collections.emptyList();
     this.isUnenforcedPrimaryKey = isUnenforcedPrimaryKey;
     this.unenforcedPrimaryKeyPosition = unenforcedPrimaryKeyPosition;
+    this.encoding = encoding;
+    this.dictionary = dictionary;
   }
 
   public int getId() {
@@ -85,16 +151,12 @@ public class LanceField {
     return nullable;
   }
 
-  public String getLogicalType() {
-    return logicalType;
-  }
-
   public ArrowType getType() {
     return type;
   }
 
-  public Optional<DictionaryEncoding> getDictionaryEncoding() {
-    return Optional.ofNullable(dictionaryEncoding);
+  public Optional<Encoding> getEncoding() {
+    return Optional.ofNullable(encoding);
   }
 
   public Map<String, String> getMetadata() {
@@ -103,6 +165,14 @@ public class LanceField {
 
   public List<LanceField> getChildren() {
     return children;
+  }
+
+  public boolean hasDictionary() {
+    return dictionary != null;
+  }
+
+  public Optional<LanceDictionary> getDictionary() {
+    return Optional.ofNullable(dictionary);
   }
 
   public boolean isUnenforcedPrimaryKey() {
@@ -121,127 +191,12 @@ public class LanceField {
     return OptionalInt.empty();
   }
 
-  public Field asArrowField() {
-    List<Field> arrowChildren =
-        children.stream().map(LanceField::asArrowField).collect(Collectors.toList());
-
-    if (type instanceof ArrowType.FixedSizeList) {
-      arrowChildren.addAll(childrenForFixedSizeList());
-    }
-
-    return new Field(
-        name, new FieldType(nullable, type, dictionaryEncoding, metadata), arrowChildren);
+  public static Builder builder() {
+    return new Builder();
   }
 
-  private List<Field> childrenForFixedSizeList() {
-    if (logicalType == null || logicalType.isEmpty()) {
-      return Collections.emptyList();
-    }
-
-    if (!(type instanceof ArrowType.FixedSizeList)) {
-      return Collections.emptyList();
-    }
-
-    if (!logicalType.startsWith("fixed_size_list:")) {
-      return Collections.emptyList();
-    }
-
-    String[] parts = logicalType.split(":");
-    if (parts.length < 3) {
-      throw new IllegalArgumentException("Unsupported logical type: " + logicalType);
-    }
-
-    String innerLogicalType =
-        Arrays.asList(parts).subList(1, parts.length - 1).stream().collect(Collectors.joining(":"));
-
-    Field itemField;
-    switch (innerLogicalType) {
-      case "lance.bfloat16":
-        itemField =
-            new Field(
-                "item",
-                new FieldType(
-                    true,
-                    new ArrowType.FixedSizeBinary(2),
-                    null,
-                    ImmutableMap.of(
-                        "ARROW:extension:name", "lance.bfloat16",
-                        "ARROW:extension:metadata", "")),
-                Collections.emptyList());
-        return Collections.singletonList(itemField);
-
-      default:
-        ArrowType elementType = arrowTypeFromLogicalType(innerLogicalType);
-        itemField =
-            new Field(
-                "item",
-                new FieldType(true, elementType, null, Collections.emptyMap()),
-                Collections.emptyList());
-        return Collections.singletonList(itemField);
-    }
-  }
-
-  private ArrowType arrowTypeFromLogicalType(String logicalType) {
-    switch (logicalType) {
-      case "null":
-        return ArrowType.Null.INSTANCE;
-      case "bool":
-        return ArrowType.Bool.INSTANCE;
-      case "int8":
-        return new ArrowType.Int(8, true);
-      case "uint8":
-        return new ArrowType.Int(8, false);
-      case "int16":
-        return new ArrowType.Int(16, true);
-      case "uint16":
-        return new ArrowType.Int(16, false);
-      case "int32":
-        return new ArrowType.Int(32, true);
-      case "uint32":
-        return new ArrowType.Int(32, false);
-      case "int64":
-        return new ArrowType.Int(64, true);
-      case "uint64":
-        return new ArrowType.Int(64, false);
-      case "halffloat":
-        return new ArrowType.FloatingPoint(FloatingPointPrecision.HALF);
-      case "float":
-        return new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE);
-      case "double":
-        return new ArrowType.FloatingPoint(FloatingPointPrecision.DOUBLE);
-      case "string":
-        return ArrowType.Utf8.INSTANCE;
-      case "binary":
-        return ArrowType.Binary.INSTANCE;
-      case "large_string":
-        return ArrowType.LargeUtf8.INSTANCE;
-      case "large_binary":
-      case "blob":
-      case "json":
-        return ArrowType.LargeBinary.INSTANCE;
-      case "date32:day":
-        return new ArrowType.Date(DateUnit.DAY);
-      case "date64:ms":
-        return new ArrowType.Date(DateUnit.MILLISECOND);
-      case "time32:s":
-        return new ArrowType.Time(TimeUnit.SECOND, 32);
-      case "time32:ms":
-        return new ArrowType.Time(TimeUnit.MILLISECOND, 32);
-      case "time64:us":
-        return new ArrowType.Time(TimeUnit.MICROSECOND, 64);
-      case "time64:ns":
-        return new ArrowType.Time(TimeUnit.NANOSECOND, 64);
-      case "duration:s":
-        return new ArrowType.Duration(TimeUnit.SECOND);
-      case "duration:ms":
-        return new ArrowType.Duration(TimeUnit.MILLISECOND);
-      case "duration:us":
-        return new ArrowType.Duration(TimeUnit.MICROSECOND);
-      case "duration:ns":
-        return new ArrowType.Duration(TimeUnit.NANOSECOND);
-      default:
-        throw new IllegalArgumentException("Unsupported logical type: " + logicalType);
-    }
+  public static Builder builder(LanceField other) {
+    return new Builder(other);
   }
 
   @Override
@@ -251,13 +206,183 @@ public class LanceField {
         .add("parentId", parentId)
         .add("name", name)
         .add("nullable", nullable)
-        .add("logicalType", logicalType)
         .add("type", type)
-        .add("dictionaryEncoding", dictionaryEncoding)
         .add("children", children)
         .add("isUnenforcedPrimaryKey", isUnenforcedPrimaryKey)
         .add("unenforcedPrimaryKeyPosition", unenforcedPrimaryKeyPosition)
+        .add("encoding", encoding)
+        .add("dictionary", dictionary)
         .add("metadata", metadata)
         .toString();
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+    LanceField that = (LanceField) o;
+    return Objects.equals(id, that.id)
+        && Objects.equals(parentId, that.parentId)
+        && Objects.equals(name, that.name)
+        && nullable == that.nullable
+        && Objects.equals(type, that.type)
+        && Objects.equals(metadata, that.metadata)
+        && Objects.equals(children, that.children)
+        && encoding == that.encoding
+        && isUnenforcedPrimaryKey == that.isUnenforcedPrimaryKey
+        && unenforcedPrimaryKeyPosition == that.unenforcedPrimaryKeyPosition
+        && Objects.equals(children, that.children)
+        && Objects.equals(dictionary, that.dictionary);
+  }
+
+  @Override
+  public int hashCode() {
+    return Objects.hash(
+        name,
+        nullable,
+        type,
+        metadata,
+        children,
+        isUnenforcedPrimaryKey,
+        unenforcedPrimaryKeyPosition,
+        encoding,
+        dictionary);
+  }
+
+  /** Builder for LanceField. */
+  public static class Builder {
+    private int id;
+    private int parentId;
+    private String name;
+    private boolean nullable;
+    private ArrowType type;
+    private Map<String, String> metadata;
+    private List<LanceField> children;
+    private boolean isUnenforcedPrimaryKey;
+    private int unenforcedPrimaryKeyPosition;
+    private Encoding encoding;
+    private LanceDictionary dictionary;
+
+    public Builder() {}
+
+    public Builder(LanceField other) {
+      this.id = other.id;
+      this.parentId = other.parentId;
+      this.name = other.name;
+      this.nullable = other.nullable;
+      this.type = other.type;
+      this.metadata = other.metadata;
+      this.children = other.children;
+      this.isUnenforcedPrimaryKey = other.isUnenforcedPrimaryKey;
+      this.unenforcedPrimaryKeyPosition = other.unenforcedPrimaryKeyPosition;
+      this.encoding = other.encoding;
+      this.dictionary = other.dictionary;
+    }
+
+    public Builder id(int id) {
+      this.id = id;
+      return this;
+    }
+
+    public Builder parentId(int parentId) {
+      this.parentId = parentId;
+      return this;
+    }
+
+    public Builder name(String name) {
+      this.name = name;
+      return this;
+    }
+
+    public Builder nullable(boolean nullable) {
+      this.nullable = nullable;
+      return this;
+    }
+
+    public Builder type(ArrowType type) {
+      this.type = type;
+      return this;
+    }
+
+    public Builder encoding(Encoding encoding) {
+      this.encoding = encoding;
+      return this;
+    }
+
+    public Builder dictionary(LanceDictionary dictionary) {
+      this.dictionary = dictionary;
+      return this;
+    }
+
+    public Builder metadata(Map<String, String> metadata) {
+      this.metadata = metadata;
+      return this;
+    }
+
+    public Builder children(List<LanceField> children) {
+      this.children = children;
+      return this;
+    }
+
+    public Builder unenforcedPrimaryKey(boolean isUnenforcedPrimaryKey) {
+      this.isUnenforcedPrimaryKey = isUnenforcedPrimaryKey;
+      return this;
+    }
+
+    public Builder unenforcedPrimaryKeyPosition(int unenforcedPrimaryKeyPosition) {
+      this.unenforcedPrimaryKeyPosition = unenforcedPrimaryKeyPosition;
+      return this;
+    }
+
+    public LanceField build() {
+      Map<String, String> resolvedMetadata =
+          metadata == null ? Collections.emptyMap() : Collections.unmodifiableMap(metadata);
+      List<LanceField> resolvedChildren =
+          children == null ? Collections.emptyList() : Collections.unmodifiableList(children);
+
+      return new LanceField(
+          id,
+          parentId,
+          name,
+          nullable,
+          type,
+          resolvedMetadata,
+          resolvedChildren,
+          isUnenforcedPrimaryKey,
+          unenforcedPrimaryKeyPosition,
+          encoding,
+          dictionary);
+    }
+  }
+
+  private static List<String> decodeDictionaryValues(byte[] bytes) {
+    try {
+      try (BufferAllocator allocator = new RootAllocator()) {
+        try (ByteArrayInputStream in = new ByteArrayInputStream(bytes);
+            ArrowStreamReader reader = new ArrowStreamReader(in, allocator)) {
+          List<String> values = new ArrayList<>();
+          while (reader.loadNextBatch()) {
+            VectorSchemaRoot root = reader.getVectorSchemaRoot();
+            VarCharVector vector = (VarCharVector) root.getVector(0);
+            int rowCount = root.getRowCount();
+            for (int i = 0; i < rowCount; i++) {
+              if (vector.isNull(i)) {
+                values.add(null);
+              } else {
+                byte[] data = vector.get(i);
+                values.add(new String(data, StandardCharsets.UTF_8));
+              }
+            }
+          }
+          return values;
+        }
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("Error reading dictionary values", e);
+    }
   }
 }

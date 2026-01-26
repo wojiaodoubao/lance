@@ -299,7 +299,7 @@ public class FragmentTest {
                 .operation(
                     Merge.builder()
                         .fragments(Collections.singletonList(mergeResult.getFragmentMetadata()))
-                        .schema(mergeResult.getSchema().asArrowSchema())
+                        .schema(mergeResult.getSchema())
                         .build())
                 .readVersion(dataset.version())
                 .build();

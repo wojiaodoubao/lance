@@ -1038,6 +1038,23 @@ public class Dataset implements Closeable {
   private native LanceSchema nativeGetLanceSchema();
 
   /**
+   * Get the maximum used field id of the dataset.
+   *
+   * <p>This value is derived from the manifest and includes fields that may have been dropped from
+   * the current schema but still exist in data files.
+   *
+   * @return the maximum field id, or -1 if the dataset has no fields
+   */
+  public int maxFieldId() {
+    try (LockManager.ReadLock readLock = lockManager.acquireReadLock()) {
+      Preconditions.checkArgument(nativeDatasetHandle != 0, "Dataset is closed");
+      return nativeGetMaxFieldId();
+    }
+  }
+
+  private native int nativeGetMaxFieldId();
+
+  /**
    * Get the {@link org.lance.Transaction} of the dataset at the current version.
    *
    * @return the Transaction
