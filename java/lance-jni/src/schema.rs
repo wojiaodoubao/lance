@@ -431,8 +431,7 @@ fn data_type_from_java_arrow_type(
     // Struct.
     let struct_class = env.find_class("org/apache/arrow/vector/types/pojo/ArrowType$Struct")?;
     if env.is_instance_of(arrow_type, struct_class)? {
-        let struct_fields: Vec<ArrowField> =
-            children.iter().map(ArrowField::from).collect();
+        let struct_fields: Vec<ArrowField> = children.iter().map(ArrowField::from).collect();
         return Ok(DataType::Struct(struct_fields.into()));
     }
 
