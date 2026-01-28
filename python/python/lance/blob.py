@@ -75,7 +75,7 @@ class BlobType(pa.ExtensionType):
                 pa.field("data", pa.large_binary(), nullable=True),
                 pa.field("uri", pa.utf8(), nullable=True),
                 pa.field("position", pa.uint64(), nullable=True),
-                pa.field("blob_size", pa.uint64(), nullable=True),
+                pa.field("size", pa.uint64(), nullable=True),
             ]
         )
         pa.ExtensionType.__init__(self, storage_type, "lance.blob.v2")
@@ -170,7 +170,7 @@ class BlobArray(pa.ExtensionArray):
         mask_arr = pa.array(null_mask, type=pa.bool_())
         storage = pa.StructArray.from_arrays(
             [data_arr, uri_arr, position_arr, size_arr],
-            names=["data", "uri", "position", "blob_size"],
+            names=["data", "uri", "position", "size"],
             mask=mask_arr,
         )
         return pa.ExtensionArray.from_storage(BlobType(), storage)  # type: ignore[return-value]
