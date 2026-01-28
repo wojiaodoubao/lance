@@ -439,8 +439,8 @@ pub enum BlobKind {
     Dedicated = 2,
     /// Not stored by Lance; `blob_uri` holds an absolute external URI.
     ///
-    /// If both `position` and `size` are non-zero, they describe a byte range within the
-    /// external object. If both are zero, the entire object is used.
+    /// External blobs can have a position and a size. Users can specify a range for an external blob.
+    /// If the position is not set, it defaults to 0, which points to the beginning of the blob.
     External = 3,
 }
 

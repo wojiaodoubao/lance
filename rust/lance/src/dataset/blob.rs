@@ -239,8 +239,8 @@ impl BlobPreprocessor {
             let position_col = struct_arr
                 .column_by_name("position")
                 .map(|col| col.as_primitive::<UInt64Type>());
-            let blob_size_col = struct_arr
-                .column_by_name("blob_size")
+            let size_col = struct_arr
+                .column_by_name("size")
                 .map(|col| col.as_primitive::<UInt64Type>());
 
             let mut data_builder = LargeBinaryBuilder::with_capacity(struct_arr.len(), 0);
@@ -272,7 +272,7 @@ impl BlobPreprocessor {
                     .as_ref()
                     .map(|col| !col.is_null(i))
                     .unwrap_or(false);
-                let has_blob_size = blob_size_col
+                let has_size = size_col
                     .as_ref()
                     .map(|col| !col.is_null(i))
                     .unwrap_or(false);
@@ -310,16 +310,13 @@ impl BlobPreprocessor {
                     data_builder.append_null();
                     uri_builder.append_value(uri_val);
                     blob_id_builder.append_null();
-                    if has_position && has_blob_size {
+                    if has_position && has_size {
                         let position = position_col
                             .as_ref()
-                            .expect("position column must exist when has_position is true")
+                            .expect("position column must exist")
                             .value(i);
-                        let blob_size = blob_size_col
-                            .as_ref()
-                            .expect("blob_size column must exist when has_blob_size is true")
-                            .value(i);
-                        blob_size_builder.append_value(blob_size);
+                        let size = size_col.as_ref().expect("size column must exist").value(i);
+                        blob_size_builder.append_value(size);
                         position_builder.append_value(position);
                     } else {
                         blob_size_builder.append_null();
