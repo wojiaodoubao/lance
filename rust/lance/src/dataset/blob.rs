@@ -611,44 +611,30 @@ impl BlobFile {
         self.uri.as_deref()
     }
 
-    /// Generate a http object URL and byte range for this blob.
+    /// Return a general accessible location and byte range for this blob.
     ///
-    /// The returned URL points at the underlying object in the dataset's
-    /// object store. The optional `(offset, length)` pair describes the
-    /// blob payload in bytes inside that object.
-    ///
-    /// If `expires` is `None`, a public object URL is returned. When it is
-    /// `Some(duration)`, backends that support pre-signed URLs may return
-    /// a URL that expires after the given duration. If the backend cannot
-    /// provide a URL, this returns `Ok(None)`.
-    pub async fn http_url_and_range(
+    /// The returned location consists of:
+    /// - a stable location URI derived from the dataset's object store.
+    /// - an optional HTTP(S) URL, which is a pre-signed URL, None if
+    ///   the backend does not provide pre-signed URL.
+    /// - a byte range `(offset, length)` describing the blob payload
+    ///   inside the underlying object.
+    pub async fn location(
         &self,
         expires: Option<Duration>,
-    ) -> Result<Option<(String, (u64, u64))>> {
-        let url_opt = if let Some(expires) = expires {
-            self.object_store.signed_url(&self.path, expires).await?
-        } else {
-            self.object_store.public_url(&self.path)?
-        };
-        Ok(url_opt.map(|url| (url.to_string(), self.range())))
-    }
+    ) -> Result<(String, Option<String>, (u64, u64))> {
+        let range = self.range();
 
-    /// Generate a signed URL for this blob's underlying object.
-    pub async fn signed_url(&self, expires: Duration) -> Result<Option<(String, (u64, u64))>> {
-        let url_opt = self.object_store.signed_url(&self.path, expires).await?;
-        Ok(url_opt.map(|url| (url.to_string(), self.range())))
-    }
+        let location_uri = self.object_store.location_uri(&self.path)?.to_string();
 
-    /// Generate a publicly accessible URL for this blob's underlying object.
-    pub async fn public_url(&self) -> Result<Option<(String, (u64, u64))>> {
-        let url_opt = self.object_store.public_url(&self.path)?;
-        Ok(url_opt.map(|url| (url.to_string(), self.range())))
-    }
+        let expires = expires.unwrap_or(Duration::from_secs(3600));
+        let url = self
+            .object_store
+            .presigned_url(&self.path, expires)
+            .await?
+            .map(|u| u.to_string());
 
-    /// Generate a stable object URL derived from the store prefix and path.
-    pub async fn object_url(&self) -> Result<(String, (u64, u64))> {
-        let url = self.object_store.object_url(&self.path)?;
-        Ok((url.to_string(), self.range()))
+        Ok((location_uri, url, range))
     }
 
     fn range(&self) -> (u64, u64) {
@@ -889,7 +875,7 @@ fn data_file_key_from_path(path: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
     use arrow::{array::AsArray, datatypes::UInt64Type};
     use arrow_array::RecordBatch;
@@ -1190,17 +1176,10 @@ mod tests {
         let blobs = fixture.dataset.take_blobs(&row_ids, "blobs").await.unwrap();
         let blob = blobs.first().unwrap();
 
-        assert!(blob.http_url_and_range(None).await.unwrap().is_none());
-        assert!(blob
-            .signed_url(Duration::from_secs(60))
-            .await
-            .unwrap()
-            .is_none());
-        assert!(blob.public_url().await.unwrap().is_none());
-
-        let (url, (offset, length)) = blob.object_url().await.unwrap();
-        assert!(!url.is_empty());
-        assert!(url.starts_with("file://"));
+        let (location_uri, presigned_url, (offset, length)) = blob.location(None).await.unwrap();
+        assert!(presigned_url.is_none());
+        assert!(!location_uri.is_empty());
+        assert!(location_uri.starts_with("file://"));
         assert_eq!(offset, blob.position());
         assert_eq!(length, blob.size());
     }

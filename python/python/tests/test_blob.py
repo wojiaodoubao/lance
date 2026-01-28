@@ -382,17 +382,33 @@ def test_blob_http_url_and_range_s3_roundtrip() -> None:
     blobs = ds.take_blobs("blob", indices=[0])
     assert len(blobs) == 1
 
-    # Use the inner LanceBlobFile to access http_url_and_range directly.
+    # Use the inner LanceBlobFile to access location directly.
     inner = blobs[0].inner
-    url, blob_range = inner.http_url_and_range(expires_in_seconds=3600)
+    location_dict = inner.location(expires_in_seconds=3600)
+    uri = location_dict["location_uri"]
+    url = location_dict["url"]
+    headers = location_dict["headers"]
 
+    assert uri.startswith("s3://")
     assert isinstance(url, str)
-    assert url
-    assert blob_range is not None
-    offset, length = blob_range
-    assert length == len(data)
-    assert offset >= 0
-    headers = {"Range": f"bytes={offset}-{offset + length - 1}"}
     resp = requests.get(url, headers=headers)
     resp.raise_for_status()
     assert resp.content == data
+
+
+def test_blob_location_local(tmp_path) -> None:
+    table = pa.table({"blob": lance.blob_array([b"foo"])})
+    ds = lance.write_dataset(table, tmp_path / "test_ds_v2", data_storage_version="2.2")
+
+    blobs = ds.take_blobs("blob", indices=[0])
+    assert len(blobs) == 1
+
+    # location should always return location_uri and headers; url may be None
+    loc = blobs[0].location()
+    assert "location_uri" in loc
+    assert isinstance(loc["location_uri"], str)
+    assert loc["location_uri"]
+    assert "headers" in loc
+    headers = loc["headers"]
+    assert isinstance(headers, dict)
+    assert "Range" in headers

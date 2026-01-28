@@ -27,9 +27,8 @@ use snafu::location;
 use tokio::sync::RwLock;
 use url::Url;
 
-use crate::object_store::object_url::{ObjectUrl, SimpleObjectUrl};
 use crate::object_store::{
-    object_url::S3ObjectUrl, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
+    object_url::ObjectUrl, ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions,
     StorageOptionsAccessor, StorageOptionsProvider, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
 };
@@ -178,19 +177,11 @@ impl ObjectStoreProvider for AwsStoreProvider {
         let store_prefix =
             self.calculate_object_store_prefix(&base_path, params.storage_options())?;
 
-        let s3_storage_options = storage_options.as_s3_options();
-        let bucket = resolve_s3_bucket(&base_path, &s3_storage_options).await?;
-        let url_provider: Arc<dyn ObjectUrl> =
-            match resolve_s3_endpoint(&bucket, &s3_storage_options).await {
-                Ok(endpoint) => Arc::new(S3ObjectUrl::new(
-                    store_prefix.clone(),
-                    bucket,
-                    endpoint,
-                    signer.clone(),
-                    opendal_operator,
-                )),
-                Err(_) => Arc::new(SimpleObjectUrl::new(store_prefix.clone())),
-            };
+        let url_provider: Arc<ObjectUrl> = Arc::new(ObjectUrl::new(
+            store_prefix.clone(),
+            signer,
+            opendal_operator,
+        ));
 
         Ok(ObjectStore {
             inner,
@@ -216,59 +207,6 @@ fn check_s3_express(url: &Url, storage_options: &StorageOptions) -> bool {
         .map(|v| v == "true")
         .unwrap_or(false)
         || url.authority().ends_with("--x-s3")
-}
-
-/// Resolve the S3 bucket from the URL or storage options.
-///
-/// If the bucket is provided in the storage options, it will be used.
-/// Otherwise, the bucket will be parsed from the URL host.
-async fn resolve_s3_bucket(
-    url: &Url,
-    storage_options: &HashMap<AmazonS3ConfigKey, String>,
-) -> Result<String> {
-    if let Some(bucket) = storage_options.get(&AmazonS3ConfigKey::Bucket) {
-        Ok(bucket.clone())
-    } else {
-        let bucket = url.host_str().ok_or_else(|| {
-            Error::invalid_input(
-                format!("Could not parse bucket from url: {}", url),
-                location!(),
-            )
-        })?;
-        Ok(bucket.to_string())
-    }
-}
-
-/// Resolve the S3 endpoint from the storage options.
-///
-/// If the endpoint is provided in the storage options, it will be used. Otherwise, return error.
-async fn resolve_s3_endpoint(
-    bucket: &str,
-    storage_options: &HashMap<AmazonS3ConfigKey, String>,
-) -> Result<String> {
-    if let Some(endpoint) = storage_options.get(&AmazonS3ConfigKey::Endpoint) {
-        let mut endpoint = if let Some(endpoint) = endpoint.strip_prefix("https://") {
-            endpoint.to_string()
-        } else if let Some(endpoint) = endpoint.strip_prefix("http://") {
-            endpoint.to_string()
-        } else {
-            endpoint.clone()
-        };
-        while endpoint.ends_with('/') {
-            endpoint.pop();
-        }
-        if let Some(endpoint) = endpoint.strip_prefix(bucket) {
-            // endpoint is in the format {bucket}.{endpoint}, remove the bucket part.
-            Ok(endpoint[1..].to_string())
-        } else {
-            Ok(endpoint)
-        }
-    } else {
-        Err(Error::invalid_input(
-            "Could not parse endpoint".to_string(),
-            location!(),
-        ))
-    }
 }
 
 /// Figure out the S3 region of the bucket.

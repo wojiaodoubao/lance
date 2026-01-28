@@ -115,8 +115,8 @@ impl<O: OSObjectStore + ?Sized> ObjectStoreExt for O {
 pub struct ObjectStore {
     // Inner object store
     pub inner: Arc<dyn OSObjectStore>,
-    /// Provider for generating signed, public, and object URLs.
-    url_provider: Arc<dyn object_url::ObjectUrl>,
+    /// Provider for generating URLs.
+    url_provider: Arc<object_url::ObjectUrl>,
     scheme: String,
     block_size: usize,
     max_iop_size: u64,
@@ -441,8 +441,8 @@ impl ObjectStore {
             let tracked_store = io_tracker.wrap("", inner);
 
             let scheme = path.scheme().to_string();
-            let url_provider: Arc<dyn object_url::ObjectUrl> =
-                Arc::new(object_url::SimpleObjectUrl::new(scheme.clone()));
+            let url_provider: Arc<object_url::ObjectUrl> =
+                Arc::new(object_url::ObjectUrl::new(scheme.clone(), None, None));
 
             let store = Self {
                 inner: tracked_store,
@@ -774,18 +774,13 @@ impl ObjectStore {
     }
 
     /// Generate a pre-signed URL for an object at the given path.
-    pub async fn signed_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
-        self.url_provider.signed_url(path, expires).await
+    pub async fn presigned_url(&self, path: &Path, expires: Duration) -> Result<Option<Url>> {
+        self.url_provider.presigned_url(path, expires).await
     }
 
-    /// Generate a publicly accessible URL for an object, where supported.
-    pub fn public_url(&self, path: &Path) -> Result<Option<Url>> {
-        self.url_provider.public_url(path)
-    }
-
-    /// Generate a stable object URL derived from the store prefix and path.
-    pub fn object_url(&self, path: &Path) -> Result<Url> {
-        self.url_provider.object_url(path)
+    /// Generate a stable location URI derived from the store prefix and path.
+    pub fn location_uri(&self, path: &Path) -> Result<Url> {
+        self.url_provider.location_uri(path)
     }
 }
 
@@ -925,8 +920,8 @@ impl ObjectStore {
         let tracked_store = io_tracker.wrap("", store);
 
         let scheme_str = scheme.to_string();
-        let url_provider: Arc<dyn object_url::ObjectUrl> =
-            Arc::new(object_url::SimpleObjectUrl::new(scheme_str.clone()));
+        let url_provider: Arc<object_url::ObjectUrl> =
+            Arc::new(object_url::ObjectUrl::new(scheme_str.clone(), None, None));
 
         Self {
             inner: tracked_store,
@@ -1345,14 +1340,12 @@ mod tests {
         let path = base.child("test_file");
 
         let signed = store
-            .signed_url(&path, Duration::from_secs(60))
+            .presigned_url(&path, Duration::from_secs(60))
             .await
             .unwrap();
-        let public = store.public_url(&path).unwrap();
-        let object = store.object_url(&path).unwrap();
+        let object = store.location_uri(&path).unwrap();
 
         assert!(signed.is_none());
-        assert!(public.is_none());
         assert_eq!(object.scheme(), "file");
         assert!(object.as_str().starts_with("file://"));
     }
@@ -1362,14 +1355,11 @@ mod tests {
         let store = ObjectStore::memory();
         let path = Path::from("path/to/file");
 
-        let object_url = store.object_url(&path).unwrap();
+        let object_url = store.location_uri(&path).unwrap();
         assert_eq!(object_url.as_str(), "memory:///path/to/file");
 
-        let public_url = store.public_url(&path).unwrap();
-        assert!(public_url.is_none());
-
         let signed_url = store
-            .signed_url(&path, Duration::from_secs(60))
+            .presigned_url(&path, Duration::from_secs(60))
             .await
             .unwrap();
         assert!(signed_url.is_none());

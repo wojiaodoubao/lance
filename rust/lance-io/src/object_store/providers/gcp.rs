@@ -14,7 +14,7 @@ use object_store::{
 };
 use url::Url;
 
-use crate::object_store::object_url::GcpObjectUrl;
+use crate::object_store::object_url::ObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -126,7 +126,7 @@ impl ObjectStoreProvider for GcsStoreProvider {
 
         let store_prefix =
             self.calculate_object_store_prefix(&base_path, params.storage_options())?;
-        let url_provider = Arc::new(GcpObjectUrl::new(
+        let url_provider = Arc::new(ObjectUrl::new(
             store_prefix.clone(),
             signer,
             opendal_operator,

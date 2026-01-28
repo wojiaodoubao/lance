@@ -9,7 +9,7 @@ use opendal::{services::Oss, Operator};
 use snafu::location;
 use url::Url;
 
-use crate::object_store::object_url::SimpleObjectUrl;
+use crate::object_store::object_url::ObjectUrl;
 use crate::object_store::{
     ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_CLOUD_BLOCK_SIZE,
     DEFAULT_CLOUD_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
@@ -91,7 +91,7 @@ impl ObjectStoreProvider for OssStoreProvider {
             })?
             .finish();
 
-        let opendal_store = Arc::new(OpendalStore::new(operator));
+        let opendal_store = Arc::new(OpendalStore::new(operator.clone()));
 
         let mut url = base_path;
         if !url.path().ends_with('/') {
@@ -99,7 +99,7 @@ impl ObjectStoreProvider for OssStoreProvider {
         }
 
         let store_prefix = self.calculate_object_store_prefix(&url, params.storage_options())?;
-        let url_provider = Arc::new(SimpleObjectUrl::new("oss".to_string()));
+        let url_provider = Arc::new(ObjectUrl::new("oss".to_string(), None, Some(operator)));
 
         Ok(ObjectStore {
             scheme: "oss".to_string(),
