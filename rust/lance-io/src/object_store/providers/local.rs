@@ -3,9 +3,10 @@
 
 use std::{collections::HashMap, sync::Arc};
 
+use crate::object_store::object_url::ObjectUrl;
 use crate::object_store::{
-    object_url::SimpleObjectUrl, ObjectStore, ObjectStoreParams, ObjectStoreProvider,
-    StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE, DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
+    ObjectStore, ObjectStoreParams, ObjectStoreProvider, StorageOptions, DEFAULT_LOCAL_BLOCK_SIZE,
+    DEFAULT_LOCAL_IO_PARALLELISM, DEFAULT_MAX_IOP_SIZE,
 };
 use lance_core::error::Result;
 use lance_core::Error;
@@ -24,7 +25,7 @@ impl ObjectStoreProvider for FileStoreProvider {
         let download_retry_count = storage_options.download_retry_count();
         Ok(ObjectStore {
             inner: Arc::new(LocalFileSystem::new()),
-            url_provider: Arc::new(SimpleObjectUrl::new("file".to_string())),
+            url_provider: Arc::new(ObjectUrl::new("file".to_string(), None, None)),
             scheme: base_path.scheme().to_owned(),
             block_size,
             max_iop_size: *DEFAULT_MAX_IOP_SIZE,
