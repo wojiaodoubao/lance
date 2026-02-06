@@ -184,5 +184,9 @@ harness = false
 name = "memtable_read"
 harness = false
 
+[[bench]]
+name = "mem_wal_read"
+harness = false
+
 [lints]
 workspace = true
