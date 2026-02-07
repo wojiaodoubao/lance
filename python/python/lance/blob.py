@@ -51,9 +51,7 @@ class Blob:
         if uri == "":
             raise ValueError("Blob uri cannot be empty")
         if position < 0 or size < 0:
-            raise ValueError(
-                "External packed blob position and size must be non-negative"
-            )
+            raise ValueError("External blob position and size must be non-negative")
         return Blob(uri=uri, position=position, size=size)
 
     @staticmethod
