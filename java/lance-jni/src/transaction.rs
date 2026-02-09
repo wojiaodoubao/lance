@@ -676,6 +676,20 @@ fn convert_to_rust_transaction(
     java_dataset: Option<&JObject>,
 ) -> Result<Transaction> {
     let read_ver = env.get_u64_from_method(&java_transaction, "readVersion")?;
+
+    // Validate read version matches the dataset version.
+    if let Some(java_dataset) = java_dataset {
+        let dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let dataset_ver = dataset_guard.inner.manifest().version;
+        if dataset_ver != read_ver {
+            return Err(Error::input_error(format!(
+                "Transaction readVersion ({}) does not match dataset version ({})",
+                read_ver, dataset_ver
+            )));
+        }
+    }
+
     let uuid = env.get_string_from_method(&java_transaction, "uuid")?;
     let op = env
         .call_method(
@@ -724,11 +738,17 @@ fn convert_schema_from_operation(
         .j()?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let schema = Schema::try_from(&c_schema)?;
-    Ok(
-        LanceSchema::try_from(&schema)
-            .expect("Failed to convert from arrow schema to lance schema"),
-    )
+    let arrow_schema = Schema::try_from(&c_schema)?;
+
+    // Derive field ids based on the current dataset schema.
+    let dataset_guard =
+        unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+    let current_schema = dataset_guard.inner.schema();
+    let max_field_id = dataset_guard.inner.manifest().max_field_id();
+
+    current_schema
+        .evolution(&arrow_schema, Some(max_field_id))
+        .map_err(|e| Error::input_error(format!("Failed to evolve schema: {e}")))
 }
 
 fn convert_to_rust_operation(

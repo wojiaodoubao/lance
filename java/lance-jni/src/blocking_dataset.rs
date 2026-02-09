@@ -748,6 +748,14 @@ pub fn inner_commit_overwrite<'local>(
     let c_schema_ptr = arrow_schema_addr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
     let arrow_schema = Schema::try_from(&c_schema)?;
+
+    // In general, in an overwrite scenario, both the schema and fragments are brand new,
+    // which means that field IDs are allocated sequentially starting from 0 for each field.
+    // In this case, there is no need to explicitly set field IDs in the arrow schema; the results
+    // inferred by LanceSchema is consistent with those in the fragments. However, in some advanced
+    // scenarios, the field IDs in fragments do not follow the "sequential allocation starting
+    // from 0" logic, such as when reusing certain data files. In such cases, it is mandatory to
+    // specify the field IDs explicitly in the arrow schema.
     let schema = LanceSchema::try_from(&arrow_schema)?;
 
     let op = Operation::Overwrite {

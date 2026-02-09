@@ -19,6 +19,8 @@ import org.lance.TestUtils;
 import org.lance.Transaction;
 import org.lance.fragment.DataFile;
 import org.lance.ipc.LanceScanner;
+import org.lance.schema.LanceField;
+import org.lance.schema.LanceSchema;
 
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.IntVector;
@@ -156,9 +158,24 @@ public class MergeTest extends OperationTestBase {
           }
           ageRoot.setRowCount(rowCount);
 
+          LanceSchema initialLanceSchema = initialDataset.getLanceSchema();
+          int idFieldId =
+              initialLanceSchema.fields().stream()
+                  .filter(f -> f.getName().equals("id"))
+                  .findFirst()
+                  .map(LanceField::getId)
+                  .orElseThrow(() -> new IllegalStateException("field 'id' not found"));
+          int maxFieldId =
+              initialLanceSchema.fields().stream().mapToInt(LanceField::getId).max().orElse(-1);
+          int ageFieldId = maxFieldId + 1;
+
           DataFile ageDataFile =
               writeLanceDataFile(
-                  dataset.allocator(), datasetPath, ageRoot, new int[] {0, 1}, new int[] {0, 1});
+                  dataset.allocator(),
+                  datasetPath,
+                  ageRoot,
+                  new int[] {idFieldId, ageFieldId},
+                  new int[] {0, 1});
 
           FragmentMetadata fragmentMeta = initialDataset.getFragment(0).metadata();
           FragmentMetadata evolvedFragment =

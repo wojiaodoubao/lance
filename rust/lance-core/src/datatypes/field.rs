@@ -49,6 +49,10 @@ pub const LANCE_UNENFORCED_PRIMARY_KEY: &str = "lance-schema:unenforced-primary-
 pub const LANCE_UNENFORCED_PRIMARY_KEY_POSITION: &str =
     "lance-schema:unenforced-primary-key:position";
 
+/// Use this config key in Arrow field metadata to specify the field id of the lance field.
+/// The value should be non-negative i32 value. Any negative value will be seen as -1.
+pub const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
 fn has_blob_v2_extension(field: &ArrowField) -> bool {
     field
         .metadata()
@@ -951,6 +955,30 @@ impl Field {
             .for_each(|f| f.set_id(self.id, id_seed));
     }
 
+    pub fn set_id_with_field(&mut self, parent_id: i32, id_seed: &mut i32, field: Option<&Self>) {
+        self.parent_id = parent_id;
+
+        if self.id < 0 {
+            if let Some(field) = field {
+                self.id = field.id;
+            } else {
+                self.id = *id_seed;
+                *id_seed += 1;
+            }
+        }
+
+        // For each child field, attempt to reuse the field ID from a compatible
+        // child in the reference field (if any).
+        for child in self.children.iter_mut() {
+            let reference_field = field.and_then(|f| {
+                f.children.iter().find(|candidate| {
+                    candidate.name == child.name && candidate.data_type() == child.data_type()
+                })
+            });
+            child.set_id_with_field(self.id, id_seed, reference_field);
+        }
+    }
+
     /// Recursively reset field ID for this field and all its children.
     pub(super) fn reset_id(&mut self) {
         self.id = -1;
@@ -1050,6 +1078,19 @@ impl TryFrom<&ArrowField> for Field {
 
     fn try_from(field: &ArrowField) -> Result<Self> {
         let mut metadata = field.metadata().clone();
+        let id = if let Some(field_id_str) = metadata.remove(LANCE_FIELD_ID_KEY) {
+            let field_id = field_id_str
+                .parse::<i32>()
+                .map_err(|e| Error::invalid_input(e.to_string(), location!()))?;
+            if field_id < 0 {
+                -1
+            } else {
+                field_id
+            }
+        } else {
+            -1
+        };
+
         let children = match field.data_type() {
             DataType::Struct(children) => children
                 .iter()
@@ -1126,7 +1167,7 @@ impl TryFrom<&ArrowField> for Field {
         };
 
         Ok(Self {
-            id: -1,
+            id,
             parent_id: -1,
             name: field.name().clone(),
             logical_type,
@@ -1188,6 +1229,25 @@ mod tests {
     use arrow_schema::{Fields, TimeUnit};
     use lance_arrow::BLOB_META_KEY;
     use std::collections::HashMap;
+
+    #[test]
+    fn arrow_field_to_field_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(LANCE_FIELD_ID_KEY.to_string(), "42".to_string());
+        metadata.insert("custom".to_string(), "value".to_string());
+
+        let arrow_field =
+            ArrowField::new("a", DataType::Int32, false).with_metadata(metadata.clone());
+        let field = Field::try_from(&arrow_field).unwrap();
+
+        assert_eq!(field.id, 42);
+        assert!(!field.metadata.contains_key(LANCE_FIELD_ID_KEY));
+        assert_eq!(
+            field.metadata.get("custom").map(String::as_str),
+            Some("value")
+        );
+    }
+
     #[test]
     fn arrow_field_to_field() {
         for (name, data_type) in [
@@ -1296,6 +1356,42 @@ mod tests {
             .0,
             "map"
         );
+    }
+
+    #[test]
+    fn test_set_id_with_field_reuses_reference_ids_and_assigns_new_ids() {
+        // Reference field `s` with child `x` and `y`
+        let reference_arrow = ArrowField::new(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("x", DataType::Int32, false),
+                ArrowField::new("y", DataType::Utf8, true),
+            ])),
+            true,
+        );
+        let mut reference_field = Field::try_from(&reference_arrow).unwrap();
+        reference_field.id = 5;
+        reference_field.child_mut("x").unwrap().id = 6;
+        reference_field.child_mut("y").unwrap().id = 7;
+
+        // New field `s` with child `x` and `z`
+        let new_arrow = ArrowField::new(
+            "s",
+            DataType::Struct(Fields::from(vec![
+                ArrowField::new("x", DataType::Int32, false),
+                ArrowField::new("z", DataType::Boolean, false),
+            ])),
+            true,
+        );
+        let mut new_field = Field::try_from(&new_arrow).unwrap();
+
+        let mut id_seed = 100;
+        new_field.set_id_with_field(-1, &mut id_seed, Some(&reference_field));
+
+        assert_eq!(new_field.id, 5);
+        assert_eq!(new_field.child("x").unwrap().id, 6);
+        assert_eq!(new_field.child("z").unwrap().id, 100);
+        assert_eq!(id_seed, 101);
     }
 
     #[test]

@@ -743,40 +743,60 @@ impl Schema {
                 location: location!(),
             })
     }
-}
 
-impl PartialEq for Schema {
-    fn eq(&self, other: &Self) -> bool {
-        self.fields == other.fields
-    }
-}
+    /// Derive a new lance schema from the current schema.
+    ///
+    /// For each field from `ArrowSchema`:
+    ///   - If the field contains `lance:field_id` in metadata, create lance field with the
+    ///     specified id.
+    ///   - Otherwise, if a lance field with same name and datatype exists in `LanceSchema`,
+    ///     use the id from the lance field.
+    ///   - Otherwise, create a new field without id. The id will finally be assigned based on
+    ///     max_field_id.
+    pub fn evolution(&self, arrow_schema: &ArrowSchema, max_field_id: Option<i32>) -> Result<Self> {
+        let mut fields = arrow_schema
+            .fields
+            .iter()
+            .map(|arrow_field| Field::try_from(arrow_field.as_ref()))
+            .collect::<Result<Vec<_>>>()?;
 
-impl fmt::Display for Schema {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        for field in self.fields.iter() {
-            writeln!(f, "{field}")?
+        // Compute current id.
+        let schema_max_id = self.max_field_id().unwrap_or(-1);
+        let max_field_id = max_field_id.unwrap_or(-1);
+        let max_id = schema_max_id.max(max_field_id);
+
+        let arrow_max_id = fields.iter().map(|f| f.max_id()).max().unwrap_or(-1);
+        if arrow_max_id > max_id {
+            return Err(Error::InvalidInput {
+                source: format!(
+                    "Max field id {} should be greater than arrow max id {}",
+                    max_id, arrow_max_id
+                )
+                .into(),
+                location: location!(),
+            });
         }
-        Ok(())
-    }
-}
+        let mut current_id = max_id + 1;
 
-/// Convert `arrow2::datatype::Schema` to Lance
-impl TryFrom<&ArrowSchema> for Schema {
-    type Error = Error;
+        for field in fields.iter_mut() {
+            let reference_field = self.fields.iter().find(|candidate| {
+                candidate.name == field.name && candidate.data_type() == field.data_type()
+            });
+            field.set_id_with_field(-1, &mut current_id, reference_field);
+        }
 
-    fn try_from(schema: &ArrowSchema) -> Result<Self> {
-        let mut schema = Self {
-            fields: schema
-                .fields
-                .iter()
-                .map(|f| Field::try_from(f.as_ref()))
-                .collect::<Result<_>>()?,
-            metadata: schema.metadata.clone(),
+        let schema = Self {
+            fields,
+            metadata: arrow_schema.metadata.clone(),
         };
-        schema.set_field_id(None);
         schema.validate()?;
+        schema.verify_primary_key()?;
 
-        let pk = schema.unenforced_primary_key();
+        Ok(schema)
+    }
+
+    fn verify_primary_key(&self) -> Result<()> {
+        let pk = self.unenforced_primary_key();
         for pk_col in pk.into_iter() {
             if !pk_col.is_leaf() {
                 return Err(Error::Schema {
@@ -785,7 +805,7 @@ impl TryFrom<&ArrowSchema> for Schema {
                 });
             }
 
-            if let Some(ancestors) = schema.field_ancestry_by_id(pk_col.id) {
+            if let Some(ancestors) = self.field_ancestry_by_id(pk_col.id) {
                 for ancestor in ancestors {
                     if ancestor.nullable {
                         return Err(Error::Schema {
@@ -819,6 +839,42 @@ impl TryFrom<&ArrowSchema> for Schema {
                 }
             }
         }
+        Ok(())
+    }
+}
+
+impl PartialEq for Schema {
+    fn eq(&self, other: &Self) -> bool {
+        self.fields == other.fields
+    }
+}
+
+impl fmt::Display for Schema {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        for field in self.fields.iter() {
+            writeln!(f, "{field}")?
+        }
+        Ok(())
+    }
+}
+
+/// Convert `arrow2::datatype::Schema` to Lance
+impl TryFrom<&ArrowSchema> for Schema {
+    type Error = Error;
+
+    fn try_from(schema: &ArrowSchema) -> Result<Self> {
+        let mut schema = Self {
+            fields: schema
+                .fields
+                .iter()
+                .map(|f| Field::try_from(f.as_ref()))
+                .collect::<Result<_>>()?,
+            metadata: schema.metadata.clone(),
+        };
+        schema.set_field_id(None);
+        schema.validate()?;
+
+        schema.verify_primary_key()?;
 
         Ok(schema)
     }
@@ -1610,6 +1666,7 @@ mod tests {
     use std::{collections::HashMap, sync::Arc};
 
     use super::*;
+    use crate::datatypes::field::LANCE_FIELD_ID_KEY;
 
     #[test]
     fn test_resolve_with_quoted_fields() {
@@ -1683,6 +1740,88 @@ mod tests {
         let field = schema.field("parent.normal_child");
         assert!(field.is_some());
         assert_eq!(field.unwrap().name, "normal_child");
+    }
+
+    #[test]
+    fn test_schema_evolution() {
+        // Base schema (existing dataset schema with stable field ids).
+        let base_arrow_schema = ArrowSchema::new(vec![
+            ArrowField::new(
+                "s",
+                ArrowDataType::Struct(ArrowFields::from(vec![
+                    ArrowField::new("x", ArrowDataType::Int32, false),
+                    ArrowField::new("y", ArrowDataType::Utf8, true),
+                ])),
+                true,
+            ),
+            ArrowField::new(
+                "l",
+                ArrowDataType::List(Arc::new(ArrowField::new(
+                    "item",
+                    ArrowDataType::Int32,
+                    true,
+                ))),
+                true,
+            ),
+        ]);
+        let base_schema = Schema::try_from(&base_arrow_schema).unwrap();
+        let base_list_id = base_schema.field("l").unwrap().id;
+        let base_list_item_id = base_schema.field("l.item").unwrap().id;
+
+        // Target arrow schema for evolution:
+        // - `s` carries explicit field id via metadata (and its child `x` too)
+        // - `l` is preserved and should reuse id from base schema
+        // - `c` is a new field (no metadata id) and should be assigned a new id
+        let mut s_meta = HashMap::new();
+        s_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "5".to_string());
+        let mut x_meta = HashMap::new();
+        x_meta.insert(LANCE_FIELD_ID_KEY.to_string(), "6".to_string());
+
+        let field_s = ArrowField::new(
+            "s",
+            ArrowDataType::Struct(ArrowFields::from(vec![
+                ArrowField::new("x", ArrowDataType::Int32, false).with_metadata(x_meta),
+                ArrowField::new("y", ArrowDataType::Utf8, true),
+            ])),
+            true,
+        )
+        .with_metadata(s_meta);
+
+        let field_l = ArrowField::new(
+            "l",
+            ArrowDataType::List(Arc::new(ArrowField::new(
+                "item",
+                ArrowDataType::Int32,
+                true,
+            ))),
+            true,
+        );
+        let field_c = ArrowField::new("c", ArrowDataType::Boolean, false);
+        let target_arrow_schema = ArrowSchema::new(vec![field_s, field_l, field_c]);
+
+        // Need to pass a max_field_id >= any explicit ids in the arrow schema.
+        // Also ensures new ids are allocated after `max_field_id`.
+        let evolved = base_schema
+            .evolution(&target_arrow_schema, Some(10))
+            .unwrap();
+
+        assert_eq!(evolved.field("s").unwrap().id, 5);
+        assert_eq!(evolved.field("s.x").unwrap().id, 6);
+        assert_eq!(evolved.field("l").unwrap().id, base_list_id);
+        assert_eq!(evolved.field("l.item").unwrap().id, base_list_item_id);
+        assert_eq!(evolved.field("c").unwrap().id, 11);
+
+        // The metadata key should not be preserved on evolved fields
+        assert!(!evolved
+            .field("s")
+            .unwrap()
+            .metadata
+            .contains_key(LANCE_FIELD_ID_KEY));
+        assert!(!evolved
+            .field("s.x")
+            .unwrap()
+            .metadata
+            .contains_key(LANCE_FIELD_ID_KEY));
     }
 
     #[test]
