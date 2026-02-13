@@ -26,6 +26,8 @@ use roaring::RoaringBitmap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use uuid::Uuid;
+use lance_core::datatypes::OnMissing::Ignore;
+use lance_core::datatypes::OnTypeMismatch::TakeSelf;
 
 impl IntoJava for &RewriteGroup {
     fn into_java<'a>(self, env: &mut JNIEnv<'a>) -> Result<JObject<'a>> {
@@ -685,7 +687,7 @@ fn convert_to_rust_transaction(
             &[],
         )?
         .l()?;
-    let op = convert_to_rust_operation(env, &op, java_dataset)?;
+    let op = convert_to_rust_operation(env, &op, java_dataset, read_ver)?;
 
     let transaction_properties = env.get_optional_from_method(
         &java_transaction,
@@ -705,6 +707,7 @@ fn convert_schema_from_operation(
     env: &mut JNIEnv,
     java_operation: &JObject,
     java_dataset: &JObject,
+    read_version: u64,
 ) -> Result<LanceSchema> {
     let java_buffer_allocator = env
         .call_method(
@@ -724,22 +727,45 @@ fn convert_schema_from_operation(
         .j()?;
     let c_schema_ptr = schema_ptr as *mut FFI_ArrowSchema;
     let c_schema = unsafe { FFI_ArrowSchema::from_raw(c_schema_ptr) };
-    let schema = Schema::try_from(&c_schema)?;
-    Ok(
-        LanceSchema::try_from(&schema)
-            .expect("Failed to convert from arrow schema to lance schema"),
-    )
+    let arrow_schema = Schema::try_from(&c_schema)?;
+
+    let mut lance_schema = LanceSchema::try_from(&arrow_schema)?;
+    let mut should_infer_field_id = false;
+    for field in &lance_schema.fields {
+        if field.id < 0 {
+            should_infer_field_id = true;
+            break;
+        }
+    }
+    if should_infer_field_id {
+        // Derive field ids based on the current dataset schema.
+        let mut dataset_guard =
+            unsafe { env.get_rust_field::<_, _, BlockingDataset>(java_dataset, NATIVE_DATASET) }?;
+        let read_schema = {
+            if dataset_guard.inner.version().version == read_version {
+                dataset_guard.inner.schema().clone()
+            } else {
+                let read_dataset = dataset_guard.checkout_version(read_version)?;
+                read_dataset.inner.schema().clone()
+            }
+        };
+        lance_schema = read_schema.project_by_schema(&lance_schema, Ignore, TakeSelf)?;
+        let max_field_id = read_schema.max_field_id();
+        lance_schema.set_field_id(max_field_id);
+    }
+    Ok(lance_schema)
 }
 
 fn convert_to_rust_operation(
     env: &mut JNIEnv<'_>,
     java_operation: &JObject<'_>,
     java_dataset: Option<&JObject<'_>>,
+    read_version: u64
 ) -> Result<Operation> {
     let op_name = env.get_string_from_method(java_operation, "name")?;
     let op = match op_name.as_str() {
         "Project" => Operation::Project {
-            schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+            schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap(), read_version)?,
         },
         "UpdateConfig" => {
             let config_updates_obj = env
@@ -860,7 +886,7 @@ fn convert_to_rust_operation(
                     to_rust_map(env, &config_upsert_values)
                 },
             )?;
-            let schema = convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?;
+            let schema = convert_schema_from_operation(env, java_operation, java_dataset.unwrap(), read_version)?;
             Operation::Overwrite {
                 fragments,
                 schema,
@@ -954,7 +980,7 @@ fn convert_to_rust_operation(
                 })?;
             Operation::Merge {
                 fragments,
-                schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap())?,
+                schema: convert_schema_from_operation(env, java_operation, java_dataset.unwrap(), read_version)?,
             }
         }
         "Restore" => {
