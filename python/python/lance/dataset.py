@@ -727,26 +727,20 @@ class LanceDataset(pa.dataset.Dataset):
              for valid SQL expressions. Expression filter is applied to filtered scan,
              full text search and vector search.
 
-            - VectorSearchQuery is a vector search that can only be applied to full
-             text search. Example:
-           .. code-block:: python
+            - Search filter is a post-filter (query filter) that re-ranks results and
+              optionally removes rows.
 
-             filter=VectorSearchQuery(
-                        "vector",
-                        np.array([12, 17, 300, 10], dtype=np.float32),
-                        5,
-                        20,
-                        True,
-                    )
+              * FullTextQuery re-ranks by BM25 score and can optionally apply
+                `score_threshold` (keep rows where `_score >= score_threshold`).
+              * VectorSearchQuery re-ranks by vector distance (top-k) and can
+                optionally apply `distance_range` (keep rows where
+                `lower_bound <= _distance < upper_bound`).
 
-            - FullTextQuery is a full text search that can only be applied to vector
-             search. Example:
-           .. code-block:: python
-
-             filter=PhraseQuery("hello world", "col")
+              Search filters can be used for any kind of scan, including non-search
+              scans.
 
             - Dictionary is a combined filter containing both expression filter with
-             key `expr_filter` and search filter with key `search_filter`. Example:
+              key `expr_filter` and search filter with key `search_filter`. Example:
            .. code-block:: python
 
                 scanner = ds.scanner(
@@ -759,7 +753,9 @@ class LanceDataset(pa.dataset.Dataset):
                     },
                     filter={
                         "expr_filter": "category='geography'",
-                        "search_filter": PhraseQuery("hello world", "col"),
+                        "search_filter": MatchQuery("hello world", "col"),
+                        # Optional, only for FullTextQuery post-filter
+                        "score_threshold": 0.0,
                     },
                 )
         limit: int, default None
@@ -4900,7 +4896,13 @@ class ScannerBuilder:
 
             search_filter = filter.get("search_filter")
             if search_filter is not None:
-                self.filter(search_filter)
+                if isinstance(search_filter, FullTextQuery):
+                    score_threshold = filter.get("score_threshold")
+                    self._search_filter = PySearchFilter.from_full_text_query(
+                        search_filter.inner, score_threshold
+                    )
+                else:
+                    self.filter(search_filter)
 
         return self
 
@@ -6274,19 +6276,60 @@ class VectorSearchQuery:
         refine_factor: Optional[int] = None,
         use_index: bool = True,
         ef: Optional[int] = None,
+        distance_range: Optional[tuple[Optional[float], Optional[float]]] = None,
     ):
-        self._inner = _build_vector_search_query(
-            column,
-            q,
-            k=k,
-            metric=metric,
-            nprobes=nprobes,
-            minimum_nprobes=minimum_nprobes,
-            maximum_nprobes=maximum_nprobes,
-            refine_factor=refine_factor,
-            use_index=use_index,
-            ef=ef,
-        )
+        q, q_dim = _coerce_query_vector(q)
 
+        if k is not None and int(k) <= 0:
+            raise ValueError(f"Nearest-K must be > 0 but got {k}")
+        if nprobes is not None and int(nprobes) <= 0:
+            raise ValueError(f"Nprobes must be > 0 but got {nprobes}")
+        if minimum_nprobes is not None and int(minimum_nprobes) < 0:
+            raise ValueError(f"Minimum nprobes must be >= 0 but got {minimum_nprobes}")
+        if maximum_nprobes is not None and int(maximum_nprobes) < 0:
+            raise ValueError(f"Maximum nprobes must be >= 0 but got {maximum_nprobes}")
+
+        if nprobes is not None:
+            if minimum_nprobes is not None or maximum_nprobes is not None:
+                raise ValueError(
+                    "nprobes cannot be set in combination with minimum_nprobes or "
+                    "maximum_nprobes"
+                )
+            else:
+                minimum_nprobes = nprobes
+                maximum_nprobes = nprobes
+        if (
+            minimum_nprobes is not None
+            and maximum_nprobes is not None
+            and minimum_nprobes > maximum_nprobes
+        ):
+            raise ValueError("minimum_nprobes must be <= maximum_nprobes")
+        if refine_factor is not None and int(refine_factor) < 1:
+            raise ValueError(f"Refine factor must be 1 or more got {refine_factor}")
+        if ef is not None and int(ef) <= 0:
+            # `ef` should be >= `k`, but `k` could be None so we can't check it here
+            # the rust code will check it
+            raise ValueError(f"ef must be > 0 but got {ef}")
+
+        if distance_range is not None:
+            if len(distance_range) != 2:
+                raise ValueError(
+                    "distance_range must be a tuple of (lower_bound, upper_bound)"
+                )
+
+        self._inner = {
+            "column": column,
+            "q": q,
+            "k": k,
+            "metric": metric,
+            "minimum_nprobes": minimum_nprobes,
+            "maximum_nprobes": maximum_nprobes,
+            "refine_factor": refine_factor,
+            "use_index": use_index,
+            "ef": ef,
+            "distance_range": distance_range,
+        }
+
+    @property
     def inner(self):
         return self._inner

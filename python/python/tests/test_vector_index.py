@@ -2792,7 +2792,7 @@ def test_distributed_ivf_pq_order_invariance(tmp_path: Path):
         assert np.allclose(a, b, atol=1e-6)
 
 
-def test_fts_filter_vector_search(tmp_path):
+def test_fts_post_filter_vector_search(tmp_path):
     # Create dataset with vector and text columns
     ids = list(range(1, 301))
     vectors = [[float(i)] * 4 for i in ids]
@@ -2838,78 +2838,20 @@ def test_fts_filter_vector_search(tmp_path):
     dataset.create_scalar_index("text", index_type="INVERTED", with_position=True)
 
     query_vector = [300.0, 300.0, 300.0, 300.0]
+    nearest = {"column": "vector", "q": query_vector, "k": 5}
 
-    # Case 1: search with prefilter=true, query_filter=match("text")
-    scanner = dataset.scanner(
-        filter=MatchQuery("text", "text"),
-        nearest={"column": "vector", "q": query_vector, "k": 5},
-        prefilter=True,
-    )
+    # Case 1: vector search + FTS post-filter
+    result = dataset.scanner(
+        nearest=nearest, filter=MatchQuery("text", "text")
+    ).to_table()
+    assert [299, 300, 296, 297, 298] == result["id"].to_pylist()
 
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [300, 299, 255, 254, 253] == ids_result
-
-    # Case 2: search with prefilter=true, search_filter=match("text"),
-    #         filter="category='geography'"
-    scanner = dataset.scanner(
-        nearest={"column": "vector", "q": query_vector, "k": 5},
-        prefilter=True,
+    # Case 2: vector search + FTS post-filter + score_threshold
+    result = dataset.scanner(
+        nearest=nearest,
         filter={
-            "expr_filter": "category='geography'",
             "search_filter": MatchQuery("text", "text"),
+            "score_threshold": float("inf"),
         },
-    )
-
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [300, 255, 252, 249, 246] == ids_result
-
-    # Case 3: search with prefilter=false, search_filter=match("text")
-    scanner = dataset.scanner(
-        filter=MatchQuery("text", "text"),
-        nearest={"column": "vector", "q": query_vector, "k": 5},
-        prefilter=False,
-    )
-
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [300, 299] == ids_result
-
-    # Case 4: search with prefilter=false, search_filter=match("text"),
-    #         filter="category='geography'"
-    scanner = dataset.scanner(
-        nearest={"column": "vector", "q": query_vector, "k": 5},
-        prefilter=False,
-        filter={
-            "expr_filter": "category='geography'",
-            "search_filter": MatchQuery("text", "text"),
-        },
-    )
-
-    result = scanner.to_table()
-    ids_result = result["id"].to_pylist()
-    assert [300] == ids_result
-
-    # Case 5: search with prefilter=false, search_filter=phrase("text")
-    scanner = dataset.scanner(
-        nearest={"column": "vector", "q": query_vector, "k": 5},
-        prefilter=False,
-        filter=PhraseQuery("text", "text"),
-    )
-
-    with pytest.raises(ValueError):
-        scanner.to_table()
-
-    # Case 6: search with prefilter=false, search_filter=phrase("text")
-    scanner = dataset.scanner(
-        nearest={"column": "vector", "q": query_vector, "k": 5},
-        prefilter=False,
-        filter={
-            "expr_filter": "category='geography'",
-            "search_filter": PhraseQuery("text", "text"),
-        },
-    )
-
-    with pytest.raises(ValueError):
-        scanner.to_table()
+    ).to_table()
+    assert [] == result["id"].to_pylist()

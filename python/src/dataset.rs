@@ -1047,36 +1047,8 @@ impl Dataset {
                 }
                 _ => scanner.nearest(&column, &q, k),
             };
-            let distance_range: Option<(Option<f32>, Option<f32>)> =
-                if let Some(dr) = nearest.get_item("distance_range")? {
-                    if dr.is_none() {
-                        None
-                    } else {
-                        let tuple = dr
-                            .downcast::<PyTuple>()
-                            .map_err(|err| PyValueError::new_err(err.to_string()))?;
-                        if tuple.len() != 2 {
-                            return Err(PyValueError::new_err(
-                                "distance_range must be a tuple of (lower_bound, upper_bound)",
-                            ));
-                        }
-                        let lower_any = tuple.get_item(0)?;
-                        let lower = if lower_any.is_none() {
-                            None
-                        } else {
-                            Some(lower_any.extract()?)
-                        };
-                        let upper_any = tuple.get_item(1)?;
-                        let upper = if upper_any.is_none() {
-                            None
-                        } else {
-                            Some(upper_any.extract()?)
-                        };
-                        Some((lower, upper))
-                    }
-                } else {
-                    None
-                };
+
+            let (lower, upper) = extract_distance_range(nearest)?;
 
             scanner
                 .map(|s| {
@@ -1094,9 +1066,7 @@ impl Dataset {
                         s = s.ef(ef);
                     }
                     s.use_index(use_index);
-                    if let Some((lower, upper)) = distance_range {
-                        s.distance_range(lower, upper);
-                    }
+                    s.distance_range(lower, upper);
                     s
                 })
                 .map_err(|err| PyValueError::new_err(err.to_string()))?;
@@ -3762,10 +3732,16 @@ pub struct PySearchFilter {
 impl PySearchFilter {
     /// Create a search filter from a full text query.
     #[staticmethod]
-    #[pyo3(signature = (query))]
-    fn from_full_text_query(query: PyFullTextQuery) -> PyResult<Self> {
+    #[pyo3(signature = (query, score_threshold=None))]
+    fn from_full_text_query(
+        query: PyFullTextQuery,
+        score_threshold: Option<f32>,
+    ) -> PyResult<Self> {
         Ok(Self {
-            inner: QueryFilter::Fts(FullTextSearchQuery::new_query(query.inner.clone())),
+            inner: QueryFilter::Fts(
+                FullTextSearchQuery::new_query(query.inner.clone()),
+                score_threshold,
+            ),
         })
     }
 
@@ -3788,12 +3764,14 @@ impl PySearchFilter {
 
         let metric_type = Some(metric_type_opt.unwrap_or(MetricType::L2));
 
+        let (lower_bound, upper_bound) = extract_distance_range(query)?;
+
         let vector_query = VectorQuery {
             column,
             key,
             k,
-            lower_bound: None,
-            upper_bound: None,
+            lower_bound,
+            upper_bound,
             minimum_nprobes,
             maximum_nprobes,
             ef,
@@ -3807,4 +3785,40 @@ impl PySearchFilter {
             inner: QueryFilter::Vector(vector_query),
         })
     }
+}
+
+fn extract_distance_range(query: &Bound<'_, PyDict>) -> PyResult<(Option<f32>, Option<f32>)> {
+    let distance_range: Option<(Option<f32>, Option<f32>)> =
+        if let Some(dr) = query.get_item("distance_range")? {
+            if dr.is_none() {
+                None
+            } else {
+                let tuple = dr
+                    .downcast::<PyTuple>()
+                    .map_err(|err| PyValueError::new_err(err.to_string()))?;
+                if tuple.len() != 2 {
+                    return Err(PyValueError::new_err(
+                        "distance_range must be a tuple of (lower_bound, upper_bound)",
+                    ));
+                }
+                let lower_any = tuple.get_item(0)?;
+                let lower = if lower_any.is_none() {
+                    None
+                } else {
+                    Some(lower_any.extract()?)
+                };
+
+                let upper_any = tuple.get_item(1)?;
+                let upper = if upper_any.is_none() {
+                    None
+                } else {
+                    Some(upper_any.extract()?)
+                };
+                Some((lower, upper))
+            }
+        } else {
+            None
+        };
+
+    Ok(distance_range.unwrap_or((None, None)))
 }
