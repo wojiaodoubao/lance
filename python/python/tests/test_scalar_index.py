@@ -15,6 +15,7 @@ import lance
 import numpy as np
 import pyarrow as pa
 import pytest
+from lance.dataset import VectorSearchQuery
 from lance.indices import IndexConfig
 from lance.query import (
     BooleanQuery,
@@ -4375,7 +4376,7 @@ def test_describe_indices(tmp_path):
         assert index.num_rows_indexed == 50
 
 
-def test_vector_filter_fts_search(tmp_path):
+def test_vector_post_filter_full_text_search(tmp_path):
     # Create test data
     ids = list(range(1, 301))
     vectors = [[float(i)] * 4 for i in ids]
@@ -4421,74 +4422,30 @@ def test_vector_filter_fts_search(tmp_path):
     )
     ds.create_scalar_index("text", index_type="INVERTED", with_position=True)
 
-    # Create vector_query
-    vector_query = {
-        "column": "vector",
-        "q": np.array([300, 300, 300, 300], dtype=np.float32),
-        "k": 5,
-        "minimum_nprobes": 20,
-        "use_index": True,
-    }
+    # Base query: full text search
+    base_fts = MatchQuery("text", "text")
 
-    # Case 1: search with prefilter=true, query_filter=vector([300,300,300,300])
-    scanner = ds.scanner(
-        prefilter=False, nearest=vector_query, filter=MatchQuery("text", "text")
+    # Post-filter: vector search (re-rank by distance)
+    vector_post_filter = VectorSearchQuery(
+        "vector",
+        np.array([300, 300, 300, 300], dtype=np.float32),
+        k=5,
+        minimum_nprobes=20,
+        use_index=True,
     )
-    result = scanner.to_table()
+
+    # Case 1: full text search + vector post-filter
+    result = ds.scanner(full_text_query=base_fts, filter=vector_post_filter).to_table()
+    assert [300, 299, 255, 254, 253] == result["id"].to_pylist()
+
+    # Case 2: full text search + vector post-filter + distance_range
+    vector_post_filter = VectorSearchQuery(
+        "vector",
+        np.array([300, 300, 300, 300], dtype=np.float32),
+        k=5,
+        minimum_nprobes=20,
+        use_index=True,
+        distance_range=(None, 5.0),
+    )
+    result = ds.scanner(full_text_query=base_fts, filter=vector_post_filter).to_table()
     assert [300, 299] == result["id"].to_pylist()
-
-    # Case 2: search with prefilter=true, search_filter=match("text"),
-    #         filter="category='geography'"
-    scanner = ds.scanner(
-        prefilter=True,
-        nearest=vector_query,
-        filter={
-            "expr_filter": "category='geography'",
-            "search_filter": MatchQuery("text", "text"),
-        },
-    )
-    result = scanner.to_table()
-    assert [300, 255, 252, 249, 246] == result["id"].to_pylist()
-
-    # Case 3: search with prefilter=false, search_filter=match("text")
-    scanner = ds.scanner(
-        prefilter=False,
-        nearest=vector_query,
-        filter=MatchQuery("text", "text"),
-    )
-    result = scanner.to_table()
-    assert [300, 299] == result["id"].to_pylist()
-
-    # Case 4: search with prefilter=false, search_filter=match("text"),
-    #       filter="category='geography'"
-    scanner = ds.scanner(
-        prefilter=False,
-        nearest=vector_query,
-        filter={
-            "expr_filter": "category='geography'",
-            "search_filter": MatchQuery("text", "text"),
-        },
-    )
-    result = scanner.to_table()
-    assert [300] == result["id"].to_pylist()
-
-    # Case 5: search with prefilter=false, search_filter=phrase("text")
-    scanner = ds.scanner(
-        prefilter=False,
-        nearest=vector_query,
-        filter=PhraseQuery("text", "text"),
-    )
-    with pytest.raises(ValueError):
-        scanner.to_table()
-
-    # Case 6: search with prefilter=false, search_filter=phrase("text")
-    scanner = ds.scanner(
-        prefilter=False,
-        nearest=vector_query,
-        filter={
-            "expr_filter": "category='geography'",
-            "search_filter": PhraseQuery("text", "text"),
-        },
-    )
-    with pytest.raises(ValueError):
-        scanner.to_table()

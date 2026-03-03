@@ -12,7 +12,7 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaR
 use arrow_select::concat::concat_batches;
 use async_recursion::async_recursion;
 use chrono::Utc;
-use datafusion::common::{DFSchema, JoinType, NullEquality, SchemaExt, exec_datafusion_err};
+use datafusion::common::{DFSchema, NullEquality, SchemaExt, exec_datafusion_err};
 use datafusion::functions_aggregate;
 use datafusion::logical_expr::{Expr, ScalarUDF, col, lit};
 use datafusion::physical_expr::PhysicalSortExpr;
@@ -34,8 +34,6 @@ use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_functions::core::getfield::GetFieldFunc;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::{LexOrdering, Partitioning, PhysicalExpr, create_physical_expr};
-use datafusion_physical_plan::joins::PartitionMode;
-use datafusion_physical_plan::projection::ProjectionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{empty::EmptyExec, joins::HashJoinExec};
 use futures::future::BoxFuture;
@@ -83,7 +81,7 @@ use crate::index::vector::utils::{
 };
 use crate::io::exec::filtered_read::{FilteredReadExec, FilteredReadOptions};
 use crate::io::exec::fts::{
-    BoostQueryExec, FlatMatchFilterExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec,
+    BoostQueryExec, FlatMatchQueryExec, MatchQueryExec, PhraseQueryExec, PostFlatMatchQueryExec,
 };
 use crate::io::exec::knn::MultivectorScoringExec;
 use crate::io::exec::scalar_index::{MaterializeIndexExec, ScalarIndexExec};
@@ -263,9 +261,8 @@ struct PlannedFilteredScan {
 }
 
 pub struct FilterPlan {
-    // Query filter plan
+    // Post query filter.
     query_filter: Option<QueryFilter>,
-    refine_query_filter: bool,
     // Expr filter plan
     expr_filter_plan: ExprFilterPlan,
 }
@@ -274,37 +271,20 @@ impl FilterPlan {
     pub fn new(query_filter: Option<QueryFilter>, expr_filter_plan: ExprFilterPlan) -> Self {
         Self {
             query_filter,
-            refine_query_filter: false,
             expr_filter_plan,
         }
     }
 
     pub fn disable_refine(&mut self) {
         self.expr_filter_plan = ExprFilterPlan::default();
-        self.refine_query_filter = false;
     }
 
     pub fn make_refine_only(&mut self) {
         self.expr_filter_plan.make_refine_only();
-        self.refine_query_filter = true;
-    }
-
-    pub fn fts_filter(&self) -> Option<FullTextSearchQuery> {
-        match &self.query_filter {
-            Some(QueryFilter::Fts(query)) => Some(query.clone()),
-            _ => None,
-        }
-    }
-
-    pub fn vector_filter(&self) -> Option<Query> {
-        match &self.query_filter {
-            Some(QueryFilter::Vector(query)) => Some(query.clone()),
-            _ => None,
-        }
     }
 
     pub fn has_refine(&self) -> bool {
-        self.expr_filter_plan.has_refine() || self.refine_query_filter
+        self.expr_filter_plan.has_refine() || self.query_filter.is_some()
     }
 
     pub async fn refine_columns(&self, dataset: &Arc<Dataset>) -> Result<Vec<String>> {
@@ -314,28 +294,25 @@ impl FilterPlan {
             columns.extend(self.expr_filter_plan.refine_columns());
         }
 
-        if self.refine_query_filter {
-            match &self.query_filter {
-                Some(QueryFilter::Fts(fts_query)) => {
-                    let cols = if fts_query.columns().is_empty() {
-                        let indexed_columns = fts_indexed_columns(dataset.clone()).await?;
-                        let q = fill_fts_query_column(&fts_query.query, &indexed_columns, false)?;
-                        q.columns()
-                    } else {
-                        fts_query.columns()
-                    };
+        match &self.query_filter {
+            Some(QueryFilter::Fts(fts_query, _threshold)) => {
+                let cols = if fts_query.columns().is_empty() {
+                    let indexed_columns = fts_indexed_columns(dataset.clone()).await?;
+                    let q = fill_fts_query_column(&fts_query.query, &indexed_columns, false)?;
+                    q.columns()
+                } else {
+                    fts_query.columns()
+                };
 
-                    // Add refine column for match query since it supports `FlatMatchQueryExec`.
-                    // Other fts query use join so we don't need to add refine column.
-                    if let FtsQuery::Match(_) = &fts_query.query {
-                        columns.extend(cols.iter().cloned().collect::<Vec<_>>());
-                    }
+                // Add refine column for match query.
+                if let FtsQuery::Match(_) = &fts_query.query {
+                    columns.extend(cols.iter().cloned().collect::<Vec<_>>());
                 }
-                Some(QueryFilter::Vector(vector_query)) => {
-                    columns.push(vector_query.column.clone());
-                }
-                None => {}
             }
+            Some(QueryFilter::Vector(vector_query)) => {
+                columns.push(vector_query.column.clone());
+            }
+            None => {}
         }
 
         Ok(columns)
@@ -348,22 +325,21 @@ impl FilterPlan {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let mut plan = input;
 
-        if self.refine_query_filter {
-            match &self.query_filter {
-                Some(QueryFilter::Fts(fts_query)) => {
-                    plan = scanner.flat_fts_filter(plan, fts_query).await?;
-                }
-                Some(QueryFilter::Vector(vector_query)) => {
-                    plan = scanner.flat_knn(plan, vector_query)?;
-                }
-                None => {}
-            }
-        }
-
         if let Some(refine_expr) = &self.expr_filter_plan.refine_expr {
             // We create a new planner specific to the node's schema, since
             // physical expressions reference column by index rather than by name.
             plan = Arc::new(LanceFilterExec::try_new(refine_expr.clone(), plan)?);
+        }
+
+        // Perform post query filter.
+        match &self.query_filter {
+            Some(QueryFilter::Fts(fts_query, threshold)) => {
+                plan = scanner.flat_fts(plan, fts_query, *threshold).await?;
+            }
+            Some(QueryFilter::Vector(vector_query)) => {
+                plan = scanner.flat_knn(plan, vector_query)?;
+            }
+            None => {}
         }
 
         Ok(plan)
@@ -385,8 +361,9 @@ impl LanceFilter {
 /// Query filter for filtering rows
 #[derive(Debug, Clone)]
 pub enum QueryFilter {
-    Fts(FullTextSearchQuery),
-    Vector(Query),
+    Fts(FullTextSearchQuery, Option<f32>), // (fts_query, score_threshold)
+    Vector(Query),                         // the threshold is configured in vector_query with
+                                           // `lower_bound` and `upper_bound`.
 }
 
 /// Expr filter for filtering rows
@@ -1162,11 +1139,11 @@ impl Scanner {
         Ok(self)
     }
 
-    /// Apply fts/vector query as filter.
+    /// Apply fts/vector query as post filter.
     ///
-    /// * Vector query filter can only be applied to full text search.
-    /// * Fts query filter can only be applied to vector search.
-    /// * Query filter couldn't be applied to normal query.
+    /// The post query filter reranks the output and optionally removes rows where:
+    /// * the BM25 score is below some threshold (fts query).
+    /// * the vector search distance is within upper_bound and lower_bound (vector query).
     ///
     /// ```rust,ignore
     /// let dataset = Dataset::open(uri).await.unwrap();
@@ -1174,9 +1151,10 @@ impl Scanner {
     /// let stream = dataset.scan()
     ///     .nearest("vector", &query_vector, 5)
     ///     .project(&["col", "col2.subfield"]).unwrap()
-    ///     .query_filter(QueryFilter::Fts(FullTextSearchQuery::new(
-    ///       "hello".to_string(),
-    ///     ))).unwrap()
+    ///     .query_filter(QueryFilter::Fts(
+    ///       FullTextSearchQuery::new("hello".to_string()),
+    ///       None,
+    ///     )).unwrap()
     ///     .limit(10)
     ///     .into_stream();
     /// ```
@@ -2211,26 +2189,6 @@ impl Scanner {
             FilterPlan::new(self.filter.query_filter.clone(), ExprFilterPlan::default())
         };
 
-        // Check query filter
-        if filter_plan.query_filter.is_some()
-            && self.nearest.is_none()
-            && self.full_text_query.is_none()
-        {
-            return Err(Error::invalid_input_source(
-                "Query filter can only be used with full text search or vector search".into(),
-            ));
-        }
-        if self.nearest.is_some() && filter_plan.vector_filter().is_some() {
-            return Err(Error::invalid_input_source(
-                "Query filter can't be used with vector search".into(),
-            ));
-        }
-        if self.full_text_query.is_some() && filter_plan.fts_filter().is_some() {
-            return Err(Error::invalid_input_source(
-                "Fts filter can't be used with fts search".into(),
-            ));
-        }
-
         Ok(filter_plan)
     }
 
@@ -2806,18 +2764,10 @@ impl Scanner {
 
         // The source is an FTS search
         if self.prefilter {
-            let source: Arc<dyn ExecutionPlan> = match &filter_plan.vector_filter() {
-                Some(vector_query) => {
-                    // Perform vector search first then rerank according to BM25 scores
-                    let vector_plan = self
-                        .vector_search(&filter_plan.expr_filter_plan, vector_query)
-                        .await?;
-                    self.fts_rerank(vector_plan, query).await?
-                }
-                None => self.fts(&filter_plan.expr_filter_plan, query).await?,
-            };
             // If we are prefiltering then the fts node will take care of the filter
-            filter_plan.disable_refine();
+            let source = self.fts(&filter_plan.expr_filter_plan, query).await?;
+            *filter_plan =
+                FilterPlan::new(filter_plan.query_filter.clone(), ExprFilterPlan::default());
             Ok(source)
         } else {
             // If we are postfiltering then we can't use scalar indices for the filter
@@ -2836,38 +2786,20 @@ impl Scanner {
                 "Cannot include deleted rows in a nearest neighbor search".into(),
             ));
         }
-        let Some(query) = self.nearest.as_ref() else {
-            return Err(Error::invalid_input("No nearest query".to_string()));
-        };
 
         if self.prefilter {
             log::trace!("source is a vector search (prefilter)");
             // If we are prefiltering then the ann / knn node will take care of the filter
-            let source: Arc<dyn ExecutionPlan> = match &filter_plan.fts_filter() {
-                Some(fts_query) => {
-                    let fts_plan = self.fts(&filter_plan.expr_filter_plan, fts_query).await?;
-                    let projection = self
-                        .dataset
-                        .empty_projection()
-                        .union_column(&query.column, OnMissing::Error)?;
-                    let plan = self.take(fts_plan, projection)?;
-
-                    self.flat_knn(plan, query)?
-                }
-                None => {
-                    self.vector_search(&filter_plan.expr_filter_plan, query)
-                        .await?
-                }
-            };
-
-            filter_plan.disable_refine();
+            let source = self.vector_search(&filter_plan.expr_filter_plan).await?;
+            *filter_plan =
+                FilterPlan::new(filter_plan.query_filter.clone(), ExprFilterPlan::default());
             Ok(source)
         } else {
             log::trace!("source is a vector search (postfilter)");
             // If we are postfiltering then we can't use scalar indices for the filter
             // and will need to run the postfilter in memory
             filter_plan.make_refine_only();
-            self.vector_search(&ExprFilterPlan::default(), query).await
+            self.vector_search(&ExprFilterPlan::default()).await
         }
     }
 
@@ -3398,12 +3330,13 @@ impl Scanner {
     }
 
     // ANN/KNN search execution node with optional prefilter
-    async fn vector_search(
-        &self,
-        filter_plan: &ExprFilterPlan,
-        q: &Query,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let mut q = q.clone();
+    async fn vector_search(&self, filter_plan: &ExprFilterPlan) -> Result<Arc<dyn ExecutionPlan>> {
+        let Some(nearest) = self.nearest.as_ref() else {
+            return Err(Error::invalid_input("No nearest query".to_string()));
+        };
+
+        // Clone so we can adjust the metric type based on the available index.
+        let mut q = nearest.clone();
 
         // Sanity check
         let (vector_type, element_type) = get_vector_type(self.dataset.schema(), &q.column)?;
@@ -3941,14 +3874,14 @@ impl Scanner {
         )?))
     }
 
-    /// Here we use a full text search as a post-filter.  Any rows that
-    /// do not contain at least one query token are removed.
+    /// Here we use a full text search as a post-filter and rerank according to BM25 scores.
     ///
     /// Only valid (currently) for match queries.
-    async fn flat_fts_filter(
+    async fn flat_fts(
         &self,
         input: Arc<dyn ExecutionPlan>,
         q: &FullTextSearchQuery,
+        score_threshold: Option<f32>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let fts_query = if q.columns().is_empty() {
             let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
@@ -3978,100 +3911,40 @@ impl Scanner {
                     input
                 };
 
-                Ok(Arc::new(FlatMatchFilterExec::new(
-                    input,
+                let mut plan: Arc<dyn ExecutionPlan> = Arc::new(PostFlatMatchQueryExec::new(
                     self.dataset.clone(),
                     match_query.clone(),
                     q.params(),
-                )))
+                    input,
+                ));
+
+                if let Some(threshold) = score_threshold {
+                    let expr = col(SCORE_COL).gt_eq(lit(threshold));
+                    plan = Arc::new(LanceFilterExec::try_new(expr, plan)?);
+                }
+
+                // Rerank by BM25 score (desc). Tie-break by row id (asc) for deterministic output.
+                let sort_expr = PhysicalSortExpr {
+                    expr: expressions::col(SCORE_COL, plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: true,
+                        nulls_first: false,
+                    },
+                };
+                let sort_expr_row_id = PhysicalSortExpr {
+                    expr: expressions::col(ROW_ID, plan.schema().as_ref())?,
+                    options: SortOptions {
+                        descending: false,
+                        nulls_first: false,
+                    },
+                };
+                plan = Arc::new(SortExec::new([sort_expr, sort_expr_row_id].into(), plan));
+
+                Ok(plan)
             }
             _ => Err(Error::not_supported(
                 "Only Match queries are supported currently when using FTS as a post-filter",
             )),
-        }
-    }
-
-    /// Here we consume all input (as unindexed) and rerank according to BM25 scores
-    ///
-    /// If there is an index on the column then we still use the index to determine the
-    /// tokenizer and inform the BM25 scoring (e.g. avg doc length, token frequency, etc.)
-    async fn fts_rerank(
-        &self,
-        input: Arc<dyn ExecutionPlan>,
-        q: &FullTextSearchQuery,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let fts_query = if q.columns().is_empty() {
-            let indexed_columns = fts_indexed_columns(self.dataset.clone()).await?;
-            fill_fts_query_column(&q.query, &indexed_columns, false)?
-        } else {
-            q.query.clone()
-        };
-
-        match &fts_query {
-            FtsQuery::Match(match_query) => {
-                let schema = Arc::new((input.schema()).try_with_column(SCORE_FIELD.clone())?);
-
-                let column = match_query
-                    .column
-                    .as_ref()
-                    .ok_or(Error::invalid_input(
-                        "the column must be specified in the query".to_string(),
-                    ))?
-                    .clone();
-                let input = if schema.column_with_name(&column).is_none() {
-                    let projection = self
-                        .dataset
-                        .empty_projection()
-                        .union_column(&column, OnMissing::Error)?;
-                    self.take(input, projection)?
-                } else {
-                    input
-                };
-
-                Ok(Arc::new(FlatMatchQueryExec::new(
-                    self.dataset.clone(),
-                    match_query.clone(),
-                    q.params(),
-                    input,
-                )))
-            }
-            _ => {
-                let default_filter = ExprFilterPlan::default();
-                let fts_plan = self.fts(&default_filter, q).await?;
-
-                let vector_row_id = Column::new_with_schema(ROW_ID, input.schema().as_ref())?;
-                let fts_row_id = Column::new_with_schema(ROW_ID, fts_plan.schema().as_ref())?;
-                let join = HashJoinExec::try_new(
-                    input,
-                    fts_plan,
-                    vec![(Arc::new(vector_row_id), Arc::new(fts_row_id))],
-                    None,
-                    &JoinType::Inner,
-                    None,
-                    PartitionMode::CollectLeft,
-                    NullEquality::NullEqualsNull,
-                )?;
-
-                let schema = join.schema();
-                let mut projection_exprs = Vec::new();
-                let mut contain_rowid = false;
-                for field in schema.fields() {
-                    if field.name() == ROW_ID {
-                        if contain_rowid {
-                            continue;
-                        }
-                        contain_rowid = true;
-                    }
-                    projection_exprs.push((
-                        Arc::new(Column::new_with_schema(field.name(), schema.as_ref())?)
-                            as Arc<dyn PhysicalExpr>,
-                        field.name().clone(),
-                    ));
-                }
-
-                let projection_exec = ProjectionExec::try_new(projection_exprs, Arc::new(join))?;
-                Ok(Arc::new(projection_exec))
-            }
         }
     }
 
