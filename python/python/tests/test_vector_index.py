@@ -21,7 +21,7 @@ import pytest
 from lance import LanceDataset, LanceFragment
 from lance.dataset import Index, VectorIndexReader
 from lance.indices import IndexFileVersion, IndicesBuilder
-from lance.query import MatchQuery, PhraseQuery
+from lance.query import MatchQuery
 from lance.util import validate_vector_index  # noqa: E402
 from lance.vector import vec_to_table  # noqa: E402
 
