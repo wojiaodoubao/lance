@@ -2277,6 +2277,7 @@ impl LanceNamespace for DirectoryNamespace {
                         metadata: Some(metadata_json),
                     }],
                     None,
+                    None,
                 )
                 .await
             {
