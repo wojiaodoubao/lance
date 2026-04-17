@@ -39,7 +39,7 @@ use lance_core::Result;
 use lance_core::cache::LanceCache;
 use roaring::RoaringBitmap;
 
-use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones, search_zones};
+use super::zoned::{ZoneBound, ZoneProcessor, ZoneTrainer, rebuild_zones_parallel, search_zones};
 
 const BLOOMFILTER_FILENAME: &str = "bloomfilter.lance";
 const BLOOMFILTER_ITEM_META_KEY: &str = "bloomfilter_item";
@@ -441,11 +441,19 @@ impl ScalarIndex for BloomFilterIndex {
         let params = BloomFilterIndexBuilderParams {
             number_of_items: self.number_of_items,
             probability: self.probability,
+            ..Default::default()
         };
 
-        let processor = BloomFilterProcessor::new(params.clone())?;
-        let trainer = ZoneTrainer::new(processor, params.number_of_items)?;
-        let updated_blocks = rebuild_zones(&self.zones, trainer, new_data).await?;
+        let parallelism = params.train_threads.unwrap_or(1);
+        let params_for_factory = params.clone();
+        let updated_blocks = rebuild_zones_parallel::<BloomFilterProcessor, _>(
+            &self.zones,
+            move || BloomFilterProcessor::new(params_for_factory.clone()),
+            params.number_of_items,
+            new_data,
+            parallelism,
+        )
+        .await?;
 
         // Write the combined zones back to storage
         let mut builder = BloomFilterIndexBuilder::try_new(params)?;
@@ -472,6 +480,7 @@ impl ScalarIndex for BloomFilterIndex {
         let params = serde_json::to_value(BloomFilterIndexBuilderParams {
             number_of_items: self.number_of_items,
             probability: self.probability,
+            ..Default::default()
         })?;
         Ok(ScalarIndexParams::for_builtin(BuiltinIndexType::BloomFilter).with_params(&params))
     }
@@ -483,6 +492,10 @@ fn default_number_of_items() -> u64 {
 
 fn default_probability() -> f64 {
     *DEFAULT_PROBABILITY
+}
+
+fn default_train_threads() -> Option<usize> {
+    *DEFAULT_TRAIN_THREADS
 }
 
 // NumberOfItems: 8192 + Probability: 0.00057(1 in 1754) -> NumberOfBytes: 16384(16KiB) + 8 SALT values
@@ -511,12 +524,31 @@ static DEFAULT_PROBABILITY: LazyLock<f64> = LazyLock::new(|| {
         .expect("failed to parse LANCE_BLOOMFILTER_DEFAULT_PROBABILITY")
 });
 
+static DEFAULT_TRAIN_THREADS: LazyLock<Option<usize>> = LazyLock::new(|| {
+    std::env::var("LANCE_BLOOMFILTER_TRAIN_THREADS")
+        .ok()
+        .map(|value| {
+            let parsed: usize = value
+                .parse()
+                .expect("failed to parse LANCE_BLOOMFILTER_TRAIN_THREADS as usize");
+            assert!(
+                parsed > 0,
+                "LANCE_BLOOMFILTER_TRAIN_THREADS must be greater than 0, got {}",
+                parsed
+            );
+            parsed
+        })
+});
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BloomFilterIndexBuilderParams {
     #[serde(default = "default_number_of_items")]
     number_of_items: u64,
     #[serde(default = "default_probability")]
     probability: f64,
+    #[serde(default = "default_train_threads")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    train_threads: Option<usize>,
 }
 
 impl Default for BloomFilterIndexBuilderParams {
@@ -524,6 +556,7 @@ impl Default for BloomFilterIndexBuilderParams {
         Self {
             number_of_items: *DEFAULT_NUMBER_OF_ITEMS,
             probability: *DEFAULT_PROBABILITY,
+            train_threads: default_train_threads(),
         }
     }
 }
@@ -534,6 +567,7 @@ impl BloomFilterIndexBuilderParams {
         Self {
             number_of_items,
             probability,
+            train_threads: None,
         }
     }
 }
@@ -555,9 +589,13 @@ impl BloomFilterIndexBuilder {
     /// contain the value column followed by `_rowaddr`, matching the order emitted by
     /// the scalar index training pipeline.
     pub async fn train(&mut self, batches_source: SendableRecordBatchStream) -> Result<()> {
-        let processor = BloomFilterProcessor::new(self.params.clone())?;
-        let trainer = ZoneTrainer::new(processor, self.params.number_of_items)?;
-        self.blocks = trainer.train(batches_source).await?;
+        let parallelism = self.params.train_threads.unwrap_or(1);
+        let params = self.params.clone();
+        let trainer = ZoneTrainer::new(
+            move || BloomFilterProcessor::new(params.clone()),
+            self.params.number_of_items,
+        )?;
+        self.blocks = trainer.train_parallel(batches_source, parallelism).await?;
         Ok(())
     }
 

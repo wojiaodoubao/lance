@@ -9,12 +9,13 @@
 
 use arrow_array::{ArrayRef, UInt64Array};
 use datafusion::execution::SendableRecordBatchStream;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, stream::FuturesUnordered};
 use lance_core::error::Error;
 use lance_core::utils::address::RowAddress;
 use lance_core::utils::mask::RowAddrTreeMap;
 use lance_core::{ROW_ADDR, Result};
 use lance_datafusion::chunker::chunk_concat_stream;
+use tokio::task::JoinHandle;
 
 //
 // Example: Suppose we have two fragments, each with 4 rows.
@@ -58,10 +59,48 @@ pub trait ZoneProcessor {
 }
 
 /// Trainer that handles chunking, fragment boundaries, and zone flushing.
-#[derive(Debug)]
 pub struct ZoneTrainer<P> {
-    processor: P,
+    processor_factory: Box<dyn Fn() -> Result<P> + Send + Sync>,
     zone_capacity: u64,
+}
+
+/// ZoneBound with data.
+#[derive(Debug)]
+struct BufferedZone {
+    bound: ZoneBound,
+    chunks: Vec<ArrayRef>,
+}
+
+struct CompletedZoneTraining<P>
+where
+    P: ZoneProcessor,
+{
+    zone_idx: usize,
+    stats: P::ZoneStatistics,
+    processor: P,
+}
+
+type ZoneTrainingTask<P> = JoinHandle<Result<CompletedZoneTraining<P>>>;
+
+fn train_buffered_zone<P>(
+    mut processor: P,
+    zone: BufferedZone,
+    zone_idx: usize,
+) -> Result<CompletedZoneTraining<P>>
+where
+    P: ZoneProcessor,
+{
+    processor.reset()?;
+    for chunk in &zone.chunks {
+        processor.process_chunk(chunk)?;
+    }
+    let stats = processor.finish_zone(zone.bound)?;
+    processor.reset()?;
+    Ok(CompletedZoneTraining {
+        zone_idx,
+        stats,
+        processor,
+    })
 }
 
 impl<P> ZoneTrainer<P>
@@ -69,14 +108,17 @@ where
     P: ZoneProcessor,
 {
     /// Create a new trainer that buffers at most `zone_capacity` rows per zone.
-    pub fn new(processor: P, zone_capacity: u64) -> Result<Self> {
+    pub fn new<F>(processor_factory: F, zone_capacity: u64) -> Result<Self>
+    where
+        F: Fn() -> Result<P> + Send + Sync + 'static,
+    {
         if zone_capacity == 0 {
             return Err(Error::invalid_input(
                 "zone capacity must be greater than zero",
             ));
         }
         Ok(Self {
-            processor,
+            processor_factory: Box::new(processor_factory),
             zone_capacity,
         })
     }
@@ -89,14 +131,19 @@ where
     /// the `_rowaddr` column with physical row addresses. Future zone-based
     /// indexes should maintain this ordering or extend the trainer to accept an
     /// explicit column index.
-    pub async fn train(
-        mut self,
+    pub async fn train_serial(
+        self,
         stream: SendableRecordBatchStream,
     ) -> Result<Vec<P::ZoneStatistics>> {
         let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
             Error::invalid_input("zone capacity does not fit into usize on this platform")
         })?;
 
+        let Self {
+            processor_factory,
+            zone_capacity: _,
+        } = self;
+        let mut processor = processor_factory()?;
         let mut batches = chunk_concat_stream(stream, zone_size);
         let mut zones = Vec::new();
         let mut current_fragment_id: Option<u64> = None;
@@ -104,7 +151,7 @@ where
         let mut zone_start_offset: Option<u64> = None;
         let mut zone_end_offset: Option<u64> = None;
 
-        self.processor.reset()?;
+        processor.reset()?;
 
         while let Some(batch) = batches.try_next().await? {
             if batch.num_rows() == 0 {
@@ -129,7 +176,7 @@ where
                     Some(current) if current != fragment_id => {
                         if current_zone_len > 0 {
                             Self::flush_zone(
-                                &mut self.processor,
+                                &mut processor,
                                 &mut zones,
                                 current,
                                 &mut current_zone_len,
@@ -152,8 +199,7 @@ where
                 let capacity = zone_size - current_zone_len;
                 let take = run_len.min(capacity);
 
-                self.processor
-                    .process_chunk(&values.slice(batch_offset, take))?;
+                processor.process_chunk(&values.slice(batch_offset, take))?;
 
                 // Track the first and last row offsets to handle non-contiguous offsets
                 // after deletions. Zone length (offset span) is computed as (last - first + 1),
@@ -174,7 +220,7 @@ where
 
                 if current_zone_len == zone_size {
                     Self::flush_zone(
-                        &mut self.processor,
+                        &mut processor,
                         &mut zones,
                         fragment_id,
                         &mut current_zone_len,
@@ -188,7 +234,7 @@ where
         if current_zone_len > 0 {
             if let Some(fragment_id) = current_fragment_id {
                 Self::flush_zone(
-                    &mut self.processor,
+                    &mut processor,
                     &mut zones,
                     fragment_id,
                     &mut current_zone_len,
@@ -196,14 +242,177 @@ where
                     &mut zone_end_offset,
                 )?;
             } else {
-                self.processor.reset()?;
+                processor.reset()?;
             }
         }
 
         Ok(zones)
     }
 
-    /// Flushes a non-empty zone and resets the processor state.
+    pub async fn train_parallel(
+        self,
+        stream: SendableRecordBatchStream,
+        parallelism: usize,
+    ) -> Result<Vec<P::ZoneStatistics>>
+    where
+        P: Send + 'static,
+        P::ZoneStatistics: Send + 'static,
+    {
+        if parallelism == 0 {
+            return Err(Error::invalid_input(
+                "parallelism must be greater than zero",
+            ));
+        }
+        let zone_size = usize::try_from(self.zone_capacity).map_err(|_| {
+            Error::invalid_input("zone capacity does not fit into usize on this platform")
+        })?;
+
+        let Self {
+            processor_factory,
+            zone_capacity: _,
+        } = self;
+
+        let mut available_processors = Vec::with_capacity(parallelism);
+        for _ in 0..parallelism {
+            available_processors.push(processor_factory()?);
+        }
+
+        let mut batches = chunk_concat_stream(stream, zone_size);
+        let mut current_fragment_id: Option<u64> = None;
+        let mut current_zone_len: usize = 0;
+        let mut zone_start_offset: Option<u64> = None;
+        let mut zone_end_offset: Option<u64> = None;
+        let mut current_chunks: Vec<ArrayRef> = Vec::new();
+        let mut next_zone_idx = 0usize;
+        let mut completed = Vec::new();
+        let mut in_flight = FuturesUnordered::new();
+
+        while let Some(batch) = batches.try_next().await? {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+
+            let values = batch.column(0);
+            let row_addr_col = batch
+                .column_by_name(ROW_ADDR)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap();
+
+            let mut batch_offset = 0usize;
+            while batch_offset < batch.num_rows() {
+                let row_addr = row_addr_col.value(batch_offset);
+                let fragment_id = row_addr >> 32;
+
+                // Zones cannot span fragments; flush current zone (if non-empty) at boundary
+                match current_fragment_id {
+                    Some(current) if current != fragment_id => {
+                        if let Some(zone) = Self::take_buffered_zone(
+                            current,
+                            &mut current_zone_len,
+                            &mut zone_start_offset,
+                            &mut zone_end_offset,
+                            &mut current_chunks,
+                        )? {
+                            Self::schedule_zone_training(
+                                zone,
+                                &mut available_processors,
+                                &mut in_flight,
+                                &mut completed,
+                                &mut next_zone_idx,
+                            )
+                            .await?;
+                        }
+                        current_fragment_id = Some(fragment_id);
+                    }
+                    None => {
+                        current_fragment_id = Some(fragment_id);
+                    }
+                    _ => {}
+                }
+
+                // Count consecutive rows in the same fragment
+                let run_len = (batch_offset..batch.num_rows())
+                    .take_while(|&idx| (row_addr_col.value(idx) >> 32) == fragment_id)
+                    .count();
+                let capacity = zone_size - current_zone_len;
+                let take = run_len.min(capacity);
+
+                current_chunks.push(values.slice(batch_offset, take));
+
+                // Track the first and last row offsets to handle non-contiguous offsets
+                // after deletions. Zone length (offset span) is computed as (last - first + 1),
+                // not the actual row count.
+                let first_offset =
+                    RowAddress::new_from_u64(row_addr_col.value(batch_offset)).row_offset() as u64;
+                let last_offset =
+                    RowAddress::new_from_u64(row_addr_col.value(batch_offset + take - 1))
+                        .row_offset() as u64;
+
+                if zone_start_offset.is_none() {
+                    zone_start_offset = Some(first_offset);
+                }
+                zone_end_offset = Some(last_offset);
+
+                current_zone_len += take;
+                batch_offset += take;
+
+                if current_zone_len == zone_size
+                    && let Some(zone) = Self::take_buffered_zone(
+                        fragment_id,
+                        &mut current_zone_len,
+                        &mut zone_start_offset,
+                        &mut zone_end_offset,
+                        &mut current_chunks,
+                    )?
+                {
+                    Self::schedule_zone_training(
+                        zone,
+                        &mut available_processors,
+                        &mut in_flight,
+                        &mut completed,
+                        &mut next_zone_idx,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if let Some(fragment_id) = current_fragment_id
+            && let Some(zone) = Self::take_buffered_zone(
+                fragment_id,
+                &mut current_zone_len,
+                &mut zone_start_offset,
+                &mut zone_end_offset,
+                &mut current_chunks,
+            )?
+        {
+            Self::schedule_zone_training(
+                zone,
+                &mut available_processors,
+                &mut in_flight,
+                &mut completed,
+                &mut next_zone_idx,
+            )
+            .await?;
+        }
+
+        while let Some(result) = in_flight.next().await {
+            let completed_zone = result.map_err(|e| {
+                Error::internal(format!("parallel zone training task failed to join: {e}"))
+            })??;
+            available_processors.push(completed_zone.processor);
+            completed.push((completed_zone.zone_idx, completed_zone.stats));
+        }
+
+        completed.sort_by_key(|(zone_idx, _)| *zone_idx);
+        Ok(completed
+            .into_iter()
+            .map(|(_, stats)| stats)
+            .collect::<Vec<_>>())
+    }
+
     fn flush_zone(
         processor: &mut P,
         zones: &mut Vec<P::ZoneStatistics>,
@@ -212,17 +421,12 @@ where
         zone_start_offset: &mut Option<u64>,
         zone_end_offset: &mut Option<u64>,
     ) -> Result<()> {
-        let start = zone_start_offset.unwrap_or(0);
-        let inferred_end =
-            zone_end_offset.unwrap_or_else(|| start + (*current_zone_len as u64).saturating_sub(1));
-        if inferred_end < start {
-            return Err(Error::invalid_input("zone row offsets are out of order"));
-        }
-        let bound = ZoneBound {
+        let bound = Self::build_zone_bound(
             fragment_id,
-            start,
-            length: (inferred_end - start + 1) as usize,
-        };
+            *current_zone_len,
+            *zone_start_offset,
+            *zone_end_offset,
+        )?;
         let stats = processor.finish_zone(bound)?;
         zones.push(stats);
         *current_zone_len = 0;
@@ -231,6 +435,110 @@ where
         processor.reset()?;
         Ok(())
     }
+
+    fn build_zone_bound(
+        fragment_id: u64,
+        current_zone_len: usize,
+        zone_start_offset: Option<u64>,
+        zone_end_offset: Option<u64>,
+    ) -> Result<ZoneBound> {
+        let start = zone_start_offset.unwrap_or(0);
+        let inferred_end =
+            zone_end_offset.unwrap_or_else(|| start + (current_zone_len as u64).saturating_sub(1));
+        if inferred_end < start {
+            return Err(Error::invalid_input("zone row offsets are out of order"));
+        }
+        Ok(ZoneBound {
+            fragment_id,
+            start,
+            length: (inferred_end - start + 1) as usize,
+        })
+    }
+
+    fn take_buffered_zone(
+        fragment_id: u64,
+        current_zone_len: &mut usize,
+        zone_start_offset: &mut Option<u64>,
+        zone_end_offset: &mut Option<u64>,
+        current_chunks: &mut Vec<ArrayRef>,
+    ) -> Result<Option<BufferedZone>> {
+        if *current_zone_len == 0 {
+            current_chunks.clear();
+            *zone_start_offset = None;
+            *zone_end_offset = None;
+            return Ok(None);
+        }
+
+        let bound = Self::build_zone_bound(
+            fragment_id,
+            *current_zone_len,
+            *zone_start_offset,
+            *zone_end_offset,
+        )?;
+        *current_zone_len = 0;
+        *zone_start_offset = None;
+        *zone_end_offset = None;
+        Ok(Some(BufferedZone {
+            bound,
+            chunks: std::mem::take(current_chunks),
+        }))
+    }
+
+    async fn schedule_zone_training(
+        zone: BufferedZone,
+        available_processors: &mut Vec<P>,
+        in_flight: &mut FuturesUnordered<ZoneTrainingTask<P>>,
+        completed: &mut Vec<(usize, P::ZoneStatistics)>,
+        next_zone_idx: &mut usize,
+    ) -> Result<()>
+    where
+        P: Send + 'static,
+        P::ZoneStatistics: Send + 'static,
+    {
+        while available_processors.is_empty() {
+            let Some(result) = in_flight.next().await else {
+                return Err(Error::internal(
+                    "zone processor pool is empty but no training task is in flight",
+                ));
+            };
+            let completed_zone = result.map_err(|e| {
+                Error::internal(format!("parallel zone training task failed to join: {e}"))
+            })??;
+            available_processors.push(completed_zone.processor);
+            completed.push((completed_zone.zone_idx, completed_zone.stats));
+        }
+
+        let Some(processor) = available_processors.pop() else {
+            return Err(Error::internal(
+                "zone processor pool unexpectedly empty before scheduling training",
+            ));
+        };
+        let zone_idx = *next_zone_idx;
+        *next_zone_idx += 1;
+        in_flight.push(tokio::task::spawn_blocking(move || {
+            train_buffered_zone(processor, zone, zone_idx)
+        }));
+        Ok(())
+    }
+}
+
+pub async fn rebuild_zones_parallel<P, F>(
+    existing: &[P::ZoneStatistics],
+    processor_factory: F,
+    zone_capacity: u64,
+    stream: SendableRecordBatchStream,
+    parallelism: usize,
+) -> Result<Vec<P::ZoneStatistics>>
+where
+    P: ZoneProcessor + Send + 'static,
+    P::ZoneStatistics: Clone + Send + 'static,
+    F: Fn() -> Result<P> + Send + Sync + 'static,
+{
+    let trainer = ZoneTrainer::new(processor_factory, zone_capacity)?;
+    let mut combined = existing.to_vec();
+    let mut new_zones = trainer.train_parallel(stream, parallelism).await?;
+    combined.append(&mut new_zones);
+    Ok(combined)
 }
 
 /// Shared search helper that loops over zones, records metrics, and
@@ -268,7 +576,7 @@ where
 /// Helper that retrains zones from `stream` and appends them to the existing
 /// statistics. Useful for index update paths that need to merge new fragments
 /// into an existing zone list.
-pub async fn rebuild_zones<P>(
+pub async fn rebuild_zones_serial<P>(
     existing: &[P::ZoneStatistics],
     trainer: ZoneTrainer<P>,
     stream: SendableRecordBatchStream,
@@ -278,7 +586,7 @@ where
     P::ZoneStatistics: Clone,
 {
     let mut combined = existing.to_vec();
-    let mut new_zones = trainer.train(stream).await?;
+    let mut new_zones = trainer.train_serial(stream).await?;
     combined.append(&mut new_zones);
     Ok(combined)
 }
@@ -292,7 +600,11 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use futures::stream;
     use lance_core::ROW_ADDR;
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     #[derive(Debug, Clone, PartialEq)]
     struct MockStats {
@@ -333,6 +645,83 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ConcurrencyTrackingProcessor {
+        tracker: Arc<ConcurrencyTracker>,
+        current_sum: i32,
+        is_active: bool,
+    }
+
+    #[derive(Debug, Default)]
+    struct ConcurrencyTracker {
+        created: AtomicUsize,
+        current: AtomicUsize,
+        max_seen: AtomicUsize,
+    }
+
+    impl ConcurrencyTrackingProcessor {
+        fn new(tracker: Arc<ConcurrencyTracker>) -> Self {
+            Self {
+                tracker,
+                current_sum: 0,
+                is_active: false,
+            }
+        }
+
+        fn mark_active(&mut self) {
+            if self.is_active {
+                return;
+            }
+            self.is_active = true;
+            let current = self.tracker.current.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self.tracker.max_seen.fetch_update(
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+                |max_seen| (current > max_seen).then_some(current),
+            );
+        }
+
+        fn mark_inactive(&mut self) {
+            if !self.is_active {
+                return;
+            }
+            self.is_active = false;
+            self.tracker.current.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for ConcurrencyTrackingProcessor {
+        fn drop(&mut self) {
+            self.mark_inactive();
+        }
+    }
+
+    impl ZoneProcessor for ConcurrencyTrackingProcessor {
+        type ZoneStatistics = MockStats;
+
+        fn process_chunk(&mut self, values: &ArrayRef) -> Result<()> {
+            self.mark_active();
+            std::thread::sleep(Duration::from_millis(25));
+            let arr = values.as_any().downcast_ref::<Int32Array>().unwrap();
+            self.current_sum += arr.iter().map(|v| v.unwrap_or(0)).sum::<i32>();
+            Ok(())
+        }
+
+        fn finish_zone(&mut self, bound: ZoneBound) -> Result<Self::ZoneStatistics> {
+            self.mark_inactive();
+            Ok(MockStats {
+                sum: self.current_sum,
+                bound,
+            })
+        }
+
+        fn reset(&mut self) -> Result<()> {
+            self.mark_inactive();
+            self.current_sum = 0;
+            Ok(())
+        }
+    }
+
     fn batch(values: Vec<i32>, fragments: Vec<u64>, offsets: Vec<u64>) -> RecordBatch {
         let val_array = Arc::new(Int32Array::from(values));
         let row_addrs: Vec<u64> = fragments
@@ -348,6 +737,24 @@ mod tests {
         RecordBatch::try_new(schema, vec![val_array, addr_array]).unwrap()
     }
 
+    fn mock_trainer(zone_capacity: u64) -> ZoneTrainer<MockProcessor> {
+        ZoneTrainer::new(|| Ok(MockProcessor::new()), zone_capacity).unwrap()
+    }
+
+    fn concurrency_trainer(
+        tracker: Arc<ConcurrencyTracker>,
+        zone_capacity: u64,
+    ) -> ZoneTrainer<ConcurrencyTrackingProcessor> {
+        ZoneTrainer::new(
+            move || {
+                tracker.created.fetch_add(1, Ordering::SeqCst);
+                Ok(ConcurrencyTrackingProcessor::new(tracker.clone()))
+            },
+            zone_capacity,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn splits_single_fragment() {
         // Single fragment with 10 rows, zone capacity = 4.
@@ -360,9 +767,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 4).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(4);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Three zones: offsets [0..=3], [4..=7], [8..=9]
         assert_eq!(stats.len(), 3);
@@ -379,6 +785,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parallel_training_matches_sequential() {
+        // Mixed fragments + multiple batches to exercise boundary flushes and partial zones.
+        let b1 = batch(
+            vec![1, 2, 3, 4, 5, 6],
+            vec![0, 0, 0, 1, 1, 1],
+            vec![0, 1, 2, 0, 1, 2],
+        );
+        let b2 = batch(vec![7, 8, 9, 10], vec![1, 1, 2, 2], vec![3, 4, 0, 1]);
+        let schema = b1.schema();
+
+        let seq_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::iter(vec![Ok(b1.clone()), Ok(b2.clone())]),
+        ));
+        let trainer = mock_trainer(4);
+        let seq = trainer.train_serial(seq_stream).await.unwrap();
+
+        let par_stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::iter(vec![Ok(b1), Ok(b2)]),
+        ));
+        let trainer = ZoneTrainer::new(|| Ok(MockProcessor::new()), 4).unwrap();
+        let par = trainer.train_parallel(par_stream, 4).await.unwrap();
+
+        assert_eq!(seq, par);
+    }
+
+    #[tokio::test]
+    async fn parallel_training_respects_concurrency_limit() {
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let values = vec![1, 2, 3, 4, 5, 6];
+        let offsets: Vec<u64> = (0..values.len() as u64).collect();
+        let batch = batch(values, vec![0; offsets.len()], offsets);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            batch.schema(),
+            stream::once(async { Ok(batch) }),
+        ));
+
+        let trainer = concurrency_trainer(tracker.clone(), 1);
+        let stats = trainer.train_parallel(stream, 2).await.unwrap();
+
+        assert_eq!(stats.len(), 6);
+        assert_eq!(tracker.created.load(Ordering::SeqCst), 2);
+        assert_eq!(tracker.max_seen.load(Ordering::SeqCst), 2);
+        assert_eq!(tracker.current.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn flushes_on_fragment_boundary() {
         // Two fragments back to back, capacity is large enough that only fragment
         // boundaries cause zone flushes. Expect two zones (one per fragment).
@@ -391,9 +845,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(10);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Two zones, one per fragment (capacity=10 is large enough)
         assert_eq!(stats.len(), 2);
@@ -416,9 +869,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let err = trainer.train(stream).await.unwrap_err();
+        let trainer = mock_trainer(10);
+        let err = trainer.train_serial(stream).await.unwrap_err();
         assert!(
             format!("{}", err).contains("zone row offsets are out of order"),
             "unexpected error: {err:?}"
@@ -445,9 +897,8 @@ mod tests {
             ]),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(10);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // One zone containing the 3 valid rows (empty batches skipped)
         assert_eq!(stats.len(), 1);
@@ -467,9 +918,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 1).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(1);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Three zones, one per row (capacity=1)
         assert_eq!(stats.len(), 3);
@@ -492,9 +942,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10000).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(10000);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // One zone containing all 100 rows (capacity is large enough)
         assert_eq!(stats.len(), 1);
@@ -505,14 +954,30 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_zero_capacity() {
-        let processor = MockProcessor::new();
-        let result = ZoneTrainer::new(processor, 0);
+        let result = ZoneTrainer::new(|| Ok(MockProcessor::new()), 0);
         assert!(result.is_err());
+        let err = result.err().unwrap();
         assert!(
-            result
-                .unwrap_err()
-                .to_string()
+            err.to_string()
                 .contains("zone capacity must be greater than zero")
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_zero_parallelism() {
+        let trainer = ZoneTrainer::new(|| Ok(MockProcessor::new()), 1).unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new(ROW_ADDR, DataType::UInt64, false),
+        ]));
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            stream::once(async { Ok(RecordBatch::new_empty(schema)) }),
+        ));
+        let err = trainer.train_parallel(stream, 0).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("parallelism must be greater than zero")
         );
     }
 
@@ -528,9 +993,8 @@ mod tests {
             stream::iter(vec![Ok(b1), Ok(b2), Ok(b3)]),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 4).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(4);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Two zones: first 4 rows, then remaining 2 rows
         assert_eq!(stats.len(), 2);
@@ -559,9 +1023,8 @@ mod tests {
             stream::iter(vec![Ok(b1), Ok(b2)]),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 3).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(3);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Three zones: frag 0 full zone, frag 0 partial (flushed at boundary), frag 1
         assert_eq!(stats.len(), 3);
@@ -600,9 +1063,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 4).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(4);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Should create 2 zones (capacity=4):
         // Zone 0: rows at offsets [0, 1, 5, 7] (4 rows)
@@ -635,9 +1097,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(10);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // One zone with 3 rows, but offset span [0..=200] so length=201 due to large gaps
         assert_eq!(stats.len(), 1);
@@ -661,9 +1122,8 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let processor = MockProcessor::new();
-        let trainer = ZoneTrainer::new(processor, 10).unwrap();
-        let stats = trainer.train(stream).await.unwrap();
+        let trainer = mock_trainer(10);
+        let stats = trainer.train_serial(stream).await.unwrap();
 
         // Should create 3 zones (one per fragment)
         assert_eq!(stats.len(), 3);
@@ -809,8 +1269,10 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
-        let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        let trainer = mock_trainer(2);
+        let rebuilt = rebuild_zones_serial(&existing, trainer, stream)
+            .await
+            .unwrap();
         // Existing zone should remain unchanged and new stats appended afterwards
         assert_eq!(rebuilt.len(), 2);
         assert_eq!(rebuilt[0].sum, 50);
@@ -839,8 +1301,10 @@ mod tests {
             stream::once(async { Ok(batch) }),
         ));
 
-        let trainer = ZoneTrainer::new(MockProcessor::new(), 2).unwrap();
-        let rebuilt = rebuild_zones(&existing, trainer, stream).await.unwrap();
+        let trainer = mock_trainer(2);
+        let rebuilt = rebuild_zones_serial(&existing, trainer, stream)
+            .await
+            .unwrap();
         // Existing zone plus two new fragments should yield three total zones
         assert_eq!(rebuilt.len(), 3);
         assert_eq!(rebuilt[0].bound.fragment_id, 0);
