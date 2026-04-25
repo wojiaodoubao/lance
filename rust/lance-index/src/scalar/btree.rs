@@ -12,7 +12,7 @@ use std::{
 
 use super::{
     AnyQuery, BuiltinIndexType, IndexReader, IndexStore, IndexWriter, MetricsCollector,
-    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchResult,
+    OldIndexDataFilter, SargableQuery, ScalarIndex, ScalarIndexParams, SearchOptions, SearchResult,
     compute_next_prefix,
 };
 use crate::{Index, IndexType};
@@ -1490,6 +1490,16 @@ impl ScalarIndex for BTreeIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
         let mut pages = match query {
             SargableQuery::Equals(val) => self
@@ -1551,7 +1561,7 @@ impl ScalarIndex for BTreeIndex {
         // We add them as Matches::Some (not Matches::All) so that
         // FlatIndex::search() evaluates the predicate and correctly marks
         // the rows as NULL rather than TRUE.
-        if !matches!(query, SargableQuery::IsNull()) {
+        if options.track_nulls && !matches!(query, SargableQuery::IsNull()) {
             let existing: HashSet<u32> = pages.iter().map(|m| m.page_id()).collect();
             for &page_id in self
                 .page_lookup
@@ -2698,7 +2708,10 @@ mod tests {
     use futures::stream;
     use lance_core::utils::mask::RowSetOps;
     use lance_core::utils::tempfile::TempObjDir;
-    use lance_core::{cache::LanceCache, utils::mask::RowAddrTreeMap};
+    use lance_core::{
+        cache::LanceCache,
+        utils::mask::{NullableRowAddrSet, RowAddrTreeMap},
+    };
     use lance_datafusion::{chunker::break_stream, datagen::DatafusionDatagenExt};
     use lance_datagen::{ArrayGeneratorExt, BatchCount, RowCount, array, gen_batch};
     use lance_io::object_store::ObjectStore;
@@ -2709,7 +2722,8 @@ mod tests {
     use crate::{
         metrics::NoOpMetricsCollector,
         scalar::{
-            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchResult,
+            IndexStore, OldIndexDataFilter, SargableQuery, ScalarIndex, SearchOptions,
+            SearchResult,
             btree::{BTREE_PAGES_NAME, BTreeIndex},
             lance_format::LanceIndexStore,
         },
@@ -2895,6 +2909,64 @@ mod tests {
         let query2 = index.search(&query, &metrics);
         tokio::join!(query1, query2).0.unwrap();
         assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn test_equality_can_skip_null_pages_without_null_tracking() {
+        let tmpdir = TempObjDir::default();
+        let test_store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = record_batch!(
+            ("value", Int32, [None, Some(5)]),
+            ("_rowid", UInt64, [0, 1])
+        )
+        .unwrap();
+        let schema = batch.schema();
+        let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+            schema,
+            stream::once(async { Ok(batch) }),
+        ));
+
+        train_btree_index(stream, test_store.as_ref(), 1, None, None)
+            .await
+            .unwrap();
+
+        let query = SargableQuery::Equals(ScalarValue::Int32(Some(5)));
+
+        let index = BTreeIndex::load(test_store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let metrics = LocalMetricsCollector::default();
+        let result = index
+            .search_with_options(&query, SearchOptions::default(), &metrics)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SearchResult::exact(RowAddrTreeMap::from_iter([1_u64]))
+        );
+        assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 1);
+
+        let index = BTreeIndex::load(test_store, None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let metrics = LocalMetricsCollector::default();
+        let result = index
+            .search_with_options(&query, SearchOptions { track_nulls: true }, &metrics)
+            .await
+            .unwrap();
+        assert_eq!(
+            result,
+            SearchResult::Exact(NullableRowAddrSet::new(
+                RowAddrTreeMap::from_iter([1_u64]),
+                RowAddrTreeMap::from_iter([0_u64]),
+            ))
+        );
+        assert_eq!(metrics.parts_loaded.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

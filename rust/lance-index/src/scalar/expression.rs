@@ -20,7 +20,7 @@ use tokio::try_join;
 
 use super::{
     AnyQuery, BloomFilterQuery, LabelListQuery, MetricsCollector, SargableQuery, ScalarIndex,
-    SearchResult, TextQuery, TokenQuery,
+    SearchOptions, SearchResult, TextQuery, TokenQuery,
 };
 #[cfg(feature = "geo")]
 use super::{GeoQuery, RelationQuery};
@@ -1417,10 +1417,12 @@ impl ScalarIndexExpr {
         &self,
         index_loader: &dyn ScalarIndexLoader,
         metrics: &dyn MetricsCollector,
+        track_nulls: bool,
     ) -> Result<NullableIndexExprResult> {
         match self {
             Self::Not(inner) => {
-                let result = inner.evaluate_impl(index_loader, metrics).await?;
+                // `NOT` must preserve NULLs from the child so SQL three-valued logic stays correct.
+                let result = inner.evaluate_impl(index_loader, metrics, true).await?;
                 // Flip certainty: NOT(AtMost) → AtLeast, NOT(AtLeast) → AtMost
                 Ok(match result {
                     NullableIndexExprResult::Exact(mask) => NullableIndexExprResult::Exact(!mask),
@@ -1433,14 +1435,14 @@ impl ScalarIndexExpr {
                 })
             }
             Self::And(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
-                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let lhs_result = lhs.evaluate_impl(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_impl(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result & rhs_result)
             }
             Self::Or(lhs, rhs) => {
-                let lhs_result = lhs.evaluate_impl(index_loader, metrics);
-                let rhs_result = rhs.evaluate_impl(index_loader, metrics);
+                let lhs_result = lhs.evaluate_impl(index_loader, metrics, track_nulls);
+                let rhs_result = rhs.evaluate_impl(index_loader, metrics, track_nulls);
                 let (lhs_result, rhs_result) = try_join!(lhs_result, rhs_result)?;
                 Ok(lhs_result | rhs_result)
             }
@@ -1448,7 +1450,13 @@ impl ScalarIndexExpr {
                 let index = index_loader
                     .load_index(&search.column, &search.index_name, metrics)
                     .await?;
-                let search_result = index.search(search.query.as_ref(), metrics).await?;
+                let search_result = index
+                    .search_with_options(
+                        search.query.as_ref(),
+                        SearchOptions { track_nulls },
+                        metrics,
+                    )
+                    .await?;
                 Ok(search_result.into())
             }
         }
@@ -1461,7 +1469,7 @@ impl ScalarIndexExpr {
         metrics: &dyn MetricsCollector,
     ) -> Result<IndexExprResult> {
         Ok(self
-            .evaluate_impl(index_loader, metrics)
+            .evaluate_impl(index_loader, metrics, false)
             .await?
             .drop_nulls())
     }
@@ -2067,17 +2075,144 @@ impl PlannerIndexExt for Planner {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     use arrow_schema::{Field, Schema};
     use chrono::Utc;
+    use datafusion::physical_plan::SendableRecordBatchStream;
     use datafusion_common::{Column, DFSchema};
     use datafusion_expr::execution_props::ExecutionProps;
     use datafusion_expr::simplify::SimplifyContext;
+    use deepsize::DeepSizeOf;
+    use lance_core::utils::mask::RowAddrTreeMap;
     use lance_datafusion::exec::{LanceExecutionOptions, get_session_context};
+    use roaring::RoaringBitmap;
 
+    use crate::metrics::NoOpMetricsCollector;
     use crate::scalar::json::{JsonQuery, JsonQueryParser};
+    use crate::scalar::registry::TrainingOrdering;
+    use crate::scalar::{
+        CreatedIndex, IndexStore, OldIndexDataFilter, ScalarIndexParams, UpdateCriteria,
+        registry::TrainingCriteria,
+    };
+    use crate::{Index, IndexType};
 
     use super::*;
+
+    #[derive(Debug, DeepSizeOf)]
+    struct TrackingScalarIndex {
+        seen_track_nulls: Arc<Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl Index for TrackingScalarIndex {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn as_index(self: Arc<Self>) -> Arc<dyn Index> {
+            self
+        }
+
+        fn as_vector_index(self: Arc<Self>) -> Result<Arc<dyn crate::vector::VectorIndex>> {
+            Err(Error::invalid_input_source(
+                "tracking scalar index is not a vector index".into(),
+            ))
+        }
+
+        fn statistics(&self) -> Result<serde_json::Value> {
+            Ok(serde_json::Value::Null)
+        }
+
+        async fn prewarm(&self) -> Result<()> {
+            Ok(())
+        }
+
+        fn index_type(&self) -> IndexType {
+            IndexType::BTree
+        }
+
+        async fn calculate_included_frags(&self) -> Result<RoaringBitmap> {
+            Ok(RoaringBitmap::new())
+        }
+    }
+
+    #[async_trait]
+    impl ScalarIndex for TrackingScalarIndex {
+        async fn search(
+            &self,
+            _query: &dyn AnyQuery,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            Err(Error::internal(
+                "tracking test expects search_with_options to be used".to_string(),
+            ))
+        }
+
+        async fn search_with_options(
+            &self,
+            _query: &dyn AnyQuery,
+            options: SearchOptions,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<SearchResult> {
+            self.seen_track_nulls
+                .lock()
+                .unwrap()
+                .push(options.track_nulls);
+            Ok(SearchResult::exact(RowAddrTreeMap::default()))
+        }
+
+        fn can_remap(&self) -> bool {
+            false
+        }
+
+        async fn remap(
+            &self,
+            _mapping: &HashMap<u64, Option<u64>>,
+            _dest_store: &dyn IndexStore,
+        ) -> Result<CreatedIndex> {
+            Err(Error::invalid_input_source(
+                "tracking scalar index does not support remap".into(),
+            ))
+        }
+
+        async fn update(
+            &self,
+            _new_data: SendableRecordBatchStream,
+            _dest_store: &dyn IndexStore,
+            _old_data_filter: Option<OldIndexDataFilter>,
+        ) -> Result<CreatedIndex> {
+            Err(Error::invalid_input_source(
+                "tracking scalar index does not support update".into(),
+            ))
+        }
+
+        fn update_criteria(&self) -> UpdateCriteria {
+            UpdateCriteria::only_new_data(TrainingCriteria::new(TrainingOrdering::Values))
+        }
+
+        fn derive_index_params(&self) -> Result<ScalarIndexParams> {
+            Ok(ScalarIndexParams::for_builtin(
+                crate::scalar::BuiltinIndexType::BTree,
+            ))
+        }
+    }
+
+    struct TrackingIndexLoader {
+        index: Arc<TrackingScalarIndex>,
+    }
+
+    #[async_trait]
+    impl ScalarIndexLoader for TrackingIndexLoader {
+        async fn load_index(
+            &self,
+            _column: &str,
+            _index_name: &str,
+            _metrics: &dyn MetricsCollector,
+        ) -> Result<Arc<dyn ScalarIndex>> {
+            Ok(self.index.clone())
+        }
+    }
 
     struct ColInfo {
         data_type: DataType,
@@ -2568,6 +2703,57 @@ mod tests {
         check_no_index(&index_info, "aisle = NULL");
         check_no_index(&index_info, "aisle BETWEEN 5 AND NULL");
         check_no_index(&index_info, "aisle BETWEEN NULL AND 10");
+    }
+
+    #[tokio::test]
+    async fn test_null_tracking_only_flows_into_negated_subtrees() {
+        let seen_track_nulls = Arc::new(Mutex::new(Vec::new()));
+        let loader = TrackingIndexLoader {
+            index: Arc::new(TrackingScalarIndex {
+                seen_track_nulls: seen_track_nulls.clone(),
+            }),
+        };
+
+        let eq_query = || {
+            ScalarIndexExpr::Query(ScalarIndexSearch {
+                column: "x".to_string(),
+                index_name: "x_idx".to_string(),
+                query: Arc::new(SargableQuery::Equals(ScalarValue::Int32(Some(5)))),
+                needs_recheck: false,
+            })
+        };
+
+        eq_query()
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(seen_track_nulls.lock().unwrap().as_slice(), &[false]);
+
+        seen_track_nulls.lock().unwrap().clear();
+        ScalarIndexExpr::Not(Box::new(eq_query()))
+            .evaluate(&loader, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        assert_eq!(seen_track_nulls.lock().unwrap().as_slice(), &[true]);
+
+        seen_track_nulls.lock().unwrap().clear();
+        ScalarIndexExpr::And(
+            Box::new(ScalarIndexExpr::Not(Box::new(ScalarIndexExpr::Query(
+                ScalarIndexSearch {
+                    column: "x".to_string(),
+                    index_name: "x_idx".to_string(),
+                    query: Arc::new(SargableQuery::IsNull()),
+                    needs_recheck: false,
+                },
+            )))),
+            Box::new(eq_query()),
+        )
+        .evaluate(&loader, &NoOpMetricsCollector)
+        .await
+        .unwrap();
+        let mut seen = seen_track_nulls.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec![false, true]);
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@ use roaring::RoaringBitmap;
 use serde::Serialize;
 use tracing::instrument;
 
-use super::{AnyQuery, IndexStore, ScalarIndex};
+use super::{AnyQuery, IndexStore, ScalarIndex, SearchOptions};
 use super::{
     BuiltinIndexType, SargableQuery, ScalarIndexParams, SearchResult, btree::OrderableScalarValue,
 };
@@ -429,7 +429,25 @@ impl ScalarIndex for BitmapIndex {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult> {
+        self.search_with_options(query, SearchOptions::default(), metrics)
+            .await
+    }
+
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
         let query = query.as_any().downcast_ref::<SargableQuery>().unwrap();
+
+        let tracked_null_rows = || {
+            if options.track_nulls && !self.null_map.is_empty() {
+                Some((*self.null_map).clone())
+            } else {
+                None
+            }
+        };
 
         let (row_ids, null_row_ids) = match query {
             SargableQuery::Equals(val) => {
@@ -440,12 +458,7 @@ impl ScalarIndex for BitmapIndex {
                 } else {
                     let key = OrderableScalarValue(val.clone());
                     let bitmap = self.load_bitmap(&key, Some(metrics)).await?;
-                    let null_rows = if !self.null_map.is_empty() {
-                        Some((*self.null_map).clone())
-                    } else {
-                        None
-                    };
-                    ((*bitmap).clone(), null_rows)
+                    ((*bitmap).clone(), tracked_null_rows())
                 }
             }
             SargableQuery::Range(start, end) => {
@@ -496,12 +509,7 @@ impl ScalarIndex for BitmapIndex {
                     RowAddrTreeMap::union_all(&bitmap_refs)
                 };
 
-                let null_rows = if !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
-                (result, null_rows)
+                (result, tracked_null_rows())
             }
             SargableQuery::IsIn(values) => {
                 metrics.record_comparisons(values.len());
@@ -547,13 +555,9 @@ impl ScalarIndex for BitmapIndex {
                     RowAddrTreeMap::union_all(&bitmap_refs)
                 };
 
-                // If the query explicitly includes null, then nulls are TRUE (not NULL)
-                // Otherwise, nulls remain NULL (unknown)
-                let null_rows = if !has_null && !self.null_map.is_empty() {
-                    Some((*self.null_map).clone())
-                } else {
-                    None
-                };
+                // If the query explicitly includes null, then nulls are TRUE (not NULL).
+                // Otherwise, preserve them only when the caller needs 3VL bookkeeping.
+                let null_rows = if has_null { None } else { tracked_null_rows() };
                 (result, null_rows)
             }
             SargableQuery::IsNull() => {
@@ -1735,9 +1739,36 @@ mod tests {
             .await
             .unwrap();
 
-        // Test 1: Search for value 5 - should return allow=[1], null=[2]
+        // Test 1.1: Search for value 5 - should return allow=[1]
         let query = SargableQuery::Equals(ScalarValue::Int64(Some(5)));
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let default_result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match default_result {
+            SearchResult::Exact(row_ids) => {
+                let actual_rows: Vec<u64> = row_ids
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![1], "Should find row 1 where value == 5");
+                assert!(
+                    row_ids.null_rows().is_empty(),
+                    "Default equality search should skip null bookkeeping"
+                );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Test 1.2: Search for value 5 with track_nulls - should return allow=[1], null=[2]
+        let result = index
+            .search_with_options(
+                &query,
+                SearchOptions { track_nulls: true },
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
 
         match result {
             SearchResult::Exact(row_ids) => {
@@ -1787,12 +1818,39 @@ mod tests {
             _ => panic!("Expected Exact search result"),
         }
 
-        // Test 3: Range query - should return matching rows and null_list
+        // Test 3.1: Range query - should return matching rows
         let query = SargableQuery::Range(
             std::ops::Bound::Included(ScalarValue::Int64(Some(0))),
             std::ops::Bound::Included(ScalarValue::Int64(Some(3))),
         );
-        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+        let default_result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        match default_result {
+            SearchResult::Exact(row_addrs) => {
+                let actual_rows: Vec<u64> = row_addrs
+                    .true_rows()
+                    .row_addrs()
+                    .unwrap()
+                    .map(u64::from)
+                    .collect();
+                assert_eq!(actual_rows, vec![0], "Should find row 0 where value == 0");
+                assert!(
+                    row_addrs.null_rows().is_empty(),
+                    "Default range search should skip null bookkeeping"
+                );
+            }
+            _ => panic!("Expected Exact search result"),
+        }
+
+        // Test 3.2: Range query - should return matching rows and null_list
+        let result = index
+            .search_with_options(
+                &query,
+                SearchOptions { track_nulls: true },
+                &NoOpMetricsCollector,
+            )
+            .await
+            .unwrap();
 
         match result {
             SearchResult::Exact(row_addrs) => {

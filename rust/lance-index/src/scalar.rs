@@ -779,6 +779,13 @@ pub enum SearchResult {
     AtLeast(NullableRowAddrSet),
 }
 
+/// Execution-time options for scalar index search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    /// If true, the search should preserve NULL rows.
+    pub track_nulls: bool,
+}
+
 impl SearchResult {
     pub fn exact(row_ids: impl Into<RowAddrTreeMap>) -> Self {
         Self::Exact(NullableRowAddrSet::new(row_ids.into(), Default::default()))
@@ -962,6 +969,19 @@ pub trait ScalarIndex: Send + Sync + std::fmt::Debug + Index + DeepSizeOf {
         query: &dyn AnyQuery,
         metrics: &dyn MetricsCollector,
     ) -> Result<SearchResult>;
+
+    /// Search the scalar index with execution-time options.
+    ///
+    /// For indices don't need `options`, just ignore `options` and fall back to `search`.
+    async fn search_with_options(
+        &self,
+        query: &dyn AnyQuery,
+        options: SearchOptions,
+        metrics: &dyn MetricsCollector,
+    ) -> Result<SearchResult> {
+        let _ = options;
+        self.search(query, metrics).await
+    }
 
     /// Returns true if the remap operation is supported
     fn can_remap(&self) -> bool;
