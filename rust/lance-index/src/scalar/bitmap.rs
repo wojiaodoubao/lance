@@ -9,8 +9,8 @@ use std::{
     sync::Arc,
 };
 
-use arrow::array::BinaryBuilder;
-use arrow_array::{Array, BinaryArray, RecordBatch, UInt64Array, new_null_array};
+use arrow::array::{BinaryBuilder, LargeBinaryBuilder};
+use arrow_array::{Array, BinaryArray, LargeBinaryArray, RecordBatch, UInt64Array, new_null_array};
 use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -29,7 +29,7 @@ use lance_core::{
     },
 };
 use roaring::RoaringBitmap;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use super::{AnyQuery, IndexStore, ScalarIndex};
@@ -44,8 +44,8 @@ use crate::{
         CreatedIndex, UpdateCriteria,
         expression::SargableQueryParser,
         registry::{
-            DefaultTrainingRequest, ScalarIndexPlugin, TrainingCriteria, TrainingOrdering,
-            TrainingRequest, VALUE_COLUMN_NAME,
+            ScalarIndexPlugin, TrainingCriteria, TrainingOrdering, TrainingRequest,
+            VALUE_COLUMN_NAME,
         },
     },
 };
@@ -109,6 +109,8 @@ pub struct BitmapIndex {
 
     value_type: DataType,
 
+    bitmap_type: DataType,
+
     store: Arc<dyn IndexStore>,
 
     index_cache: WeakLanceCache,
@@ -140,6 +142,7 @@ impl BitmapIndex {
         index_map: BTreeMap<OrderableScalarValue, usize>,
         null_map: Arc<RowAddrTreeMap>,
         value_type: DataType,
+        bitmap_type: DataType,
         store: Arc<dyn IndexStore>,
         index_cache: WeakLanceCache,
         frag_reuse_index: Option<Arc<FragReuseIndex>>,
@@ -149,6 +152,7 @@ impl BitmapIndex {
             index_map,
             null_map,
             value_type,
+            bitmap_type,
             store,
             index_cache,
             frag_reuse_index,
@@ -164,6 +168,14 @@ impl BitmapIndex {
         let page_lookup_file = store.open_index_file(BITMAP_LOOKUP_NAME).await?;
         let total_rows = page_lookup_file.num_rows();
 
+        let bitmap_type = page_lookup_file.schema().fields[1].data_type().clone();
+        if !matches!(bitmap_type, DataType::Binary | DataType::LargeBinary) {
+            return Err(Error::internal(format!(
+                "Invalid bitmap column type {:?}; expected Binary or LargeBinary",
+                bitmap_type
+            )));
+        }
+
         if total_rows == 0 {
             let schema = page_lookup_file.schema();
             let data_type = schema.fields[0].data_type();
@@ -171,6 +183,7 @@ impl BitmapIndex {
                 BTreeMap::new(),
                 Arc::new(RowAddrTreeMap::default()),
                 data_type,
+                bitmap_type,
                 store,
                 WeakLanceCache::from(index_cache),
                 frag_reuse_index,
@@ -217,12 +230,7 @@ impl BitmapIndex {
                 .read_range(null_loc..null_loc + 1, Some(&["bitmaps"]))
                 .await?;
 
-            let binary_bitmaps = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
-            let bitmap_bytes = binary_bitmaps.value(0);
+            let bitmap_bytes = bitmap_bytes_from_array(batch.column(0).as_ref(), 0)?;
             let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
             // Apply fragment remapping if needed
@@ -239,6 +247,7 @@ impl BitmapIndex {
             index_map,
             null_map,
             final_value_type,
+            bitmap_type,
             store,
             WeakLanceCache::from(index_cache),
             frag_reuse_index,
@@ -275,12 +284,8 @@ impl BitmapIndex {
             .read_range(row_offset..row_offset + 1, Some(&["bitmaps"]))
             .await?;
 
-        let binary_bitmaps = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))?;
-        let bitmap_bytes = binary_bitmaps.value(0); // First (and only) row
+        // First (and only) row
+        let bitmap_bytes = bitmap_bytes_from_array(batch.column(0).as_ref(), 0)?;
         let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
         if let Some(fri) = &self.frag_reuse_index {
@@ -335,6 +340,60 @@ struct BitmapStatistics {
     num_bitmaps: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BitmapParameters {
+    /// When enabled, write bitmap pages using Arrow LargeBinary so that a single
+    /// serialized bitmap can exceed the 2GiB Binary limit.
+    ///
+    /// Compatibility note: bitmap indices written with LargeBinary cannot be read
+    /// by older Lance versions that only support Binary.
+    #[serde(default, alias = "adaptive_bitmaps")]
+    pub enable_large_bitmaps: bool,
+}
+
+struct BitmapTrainingRequest {
+    parameters: BitmapParameters,
+    criteria: TrainingCriteria,
+}
+
+impl BitmapTrainingRequest {
+    fn new(parameters: BitmapParameters) -> Self {
+        Self {
+            parameters,
+            criteria: TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
+        }
+    }
+}
+
+impl TrainingRequest for BitmapTrainingRequest {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn criteria(&self) -> &TrainingCriteria {
+        &self.criteria
+    }
+}
+
+fn bitmap_bytes_from_array(array: &dyn Array, row: usize) -> Result<&[u8]> {
+    match array.data_type() {
+        DataType::Binary => array
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))
+            .map(|a| a.value(row)),
+        DataType::LargeBinary => array
+            .as_any()
+            .downcast_ref::<LargeBinaryArray>()
+            .ok_or_else(|| Error::internal("Invalid bitmap column type".to_string()))
+            .map(|a| a.value(row)),
+        other => Err(Error::internal(format!(
+            "Invalid bitmap column type {:?}; expected Binary or LargeBinary",
+            other
+        ))),
+    }
+}
+
 #[async_trait]
 impl Index for BitmapIndex {
     fn as_any(&self) -> &dyn Any {
@@ -371,10 +430,6 @@ impl Index for BitmapIndex {
 
             let dict_keys = chunk.column(0);
             let binary_bitmaps = chunk.column(1);
-            let bitmap_binary_array = binary_bitmaps
-                .as_any()
-                .downcast_ref::<BinaryArray>()
-                .unwrap();
 
             for idx in 0..chunk.num_rows() {
                 let key = OrderableScalarValue(ScalarValue::try_from_array(dict_keys, idx)?);
@@ -383,7 +438,7 @@ impl Index for BitmapIndex {
                     continue;
                 }
 
-                let bitmap_bytes = bitmap_binary_array.value(idx);
+                let bitmap_bytes = bitmap_bytes_from_array(binary_bitmaps.as_ref(), idx)?;
                 let mut bitmap = RowAddrTreeMap::deserialize_from(bitmap_bytes).unwrap();
 
                 if let Some(frag_reuse_index_ref) = self.frag_reuse_index.as_ref() {
@@ -589,7 +644,13 @@ impl ScalarIndex for BitmapIndex {
     ) -> Result<CreatedIndex> {
         let state = self.load_bitmap_index_state().await?;
         let remapped_state = BitmapIndexPlugin::remap_bitmap_state(state, mapping);
-        BitmapIndexPlugin::write_bitmap_index(remapped_state, dest_store, &self.value_type).await?;
+        BitmapIndexPlugin::write_bitmap_index(
+            remapped_state,
+            dest_store,
+            &self.value_type,
+            &self.bitmap_type,
+        )
+        .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -606,7 +667,13 @@ impl ScalarIndex for BitmapIndex {
         dest_store: &dyn IndexStore,
         _old_data_filter: Option<super::OldIndexDataFilter>,
     ) -> Result<CreatedIndex> {
-        BitmapIndexPlugin::streaming_build_and_write(new_data, Some(self), dest_store).await?;
+        BitmapIndexPlugin::streaming_build_and_write(
+            new_data,
+            Some(self),
+            dest_store,
+            self.bitmap_type.clone(),
+        )
+        .await?;
 
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
@@ -633,16 +700,18 @@ struct BitmapBatchWriter {
     serialized: Vec<Vec<u8>>,
     bytes: usize,
     num_bitmaps: usize,
+    bitmap_type: DataType,
 }
 
 impl BitmapBatchWriter {
-    fn new(file: Box<dyn super::IndexWriter>) -> Self {
+    fn new(file: Box<dyn super::IndexWriter>, bitmap_type: DataType) -> Self {
         Self {
             file,
             keys: Vec::new(),
             serialized: Vec::new(),
             bytes: 0,
             num_bitmaps: 0,
+            bitmap_type,
         }
     }
 
@@ -652,6 +721,13 @@ impl BitmapBatchWriter {
         let mut buf = Vec::new();
         bitmap.serialize_into(&mut buf).unwrap();
         let size = buf.len();
+
+        if matches!(self.bitmap_type, DataType::Binary) && size > MAX_BITMAP_ARRAY_LENGTH {
+            return Err(Error::invalid_input(format!(
+                "Serialized bitmap for value '{key}' is too large for Arrow Binary ({size} bytes). \
+                 Set enable_large_bitmaps=true (LargeBinary) to write huge bitmaps."
+            )));
+        }
 
         if self.bytes + size > MAX_BITMAP_ARRAY_LENGTH {
             self.flush().await?;
@@ -672,12 +748,9 @@ impl BitmapBatchWriter {
         let keys_array =
             ScalarValue::iter_to_array(self.keys.drain(..).collect::<Vec<_>>().into_iter())
                 .unwrap();
-        let total_size: usize = self.serialized.iter().map(|b| b.len()).sum();
-        let mut binary_builder = BinaryBuilder::with_capacity(self.serialized.len(), total_size);
-        for b in self.serialized.drain(..) {
-            binary_builder.append_value(&b);
-        }
-        let bitmaps_array = Arc::new(binary_builder.finish()) as Arc<dyn Array>;
+        let bitmaps_array =
+            BitmapIndexPlugin::bitmaps_array_from_borrowed(&self.bitmap_type, &self.serialized)?;
+        self.serialized.clear();
         let batch = BitmapIndexPlugin::get_batch_from_arrays(keys_array, bitmaps_array)?;
         self.file.write_record_batch(batch).await?;
         self.bytes = 0;
@@ -702,6 +775,33 @@ impl BitmapBatchWriter {
 pub struct BitmapIndexPlugin;
 
 impl BitmapIndexPlugin {
+    fn bitmaps_array_from_borrowed(
+        bitmap_type: &DataType,
+        bitmaps: &[Vec<u8>],
+    ) -> Result<Arc<dyn Array>> {
+        let total_size: usize = bitmaps.iter().map(|b| b.len()).sum();
+        match bitmap_type {
+            DataType::Binary => {
+                let mut builder = BinaryBuilder::with_capacity(bitmaps.len(), total_size);
+                for b in bitmaps {
+                    builder.append_value(b.as_slice());
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            DataType::LargeBinary => {
+                let mut builder = LargeBinaryBuilder::with_capacity(bitmaps.len(), total_size);
+                for b in bitmaps {
+                    builder.append_value(b.as_slice());
+                }
+                Ok(Arc::new(builder.finish()))
+            }
+            other => Err(Error::internal(format!(
+                "Invalid bitmap_type {:?} for bitmap writer",
+                other
+            ))),
+        }
+    }
+
     fn get_batch_from_arrays(
         keys: Arc<dyn Array>,
         binary_bitmaps: Arc<dyn Array>,
@@ -720,11 +820,13 @@ impl BitmapIndexPlugin {
         state: HashMap<ScalarValue, RowAddrTreeMap>,
         index_store: &dyn IndexStore,
         value_type: &DataType,
+        bitmap_type: &DataType,
     ) -> Result<()> {
         Self::write_bitmap_index_with_extras(
             state,
             index_store,
             value_type,
+            bitmap_type,
             HashMap::new(),
             Vec::new(),
         )
@@ -736,13 +838,14 @@ impl BitmapIndexPlugin {
         state: HashMap<ScalarValue, RowAddrTreeMap>,
         index_store: &dyn IndexStore,
         value_type: &DataType,
+        bitmap_type: &DataType,
         mut metadata: HashMap<String, String>,
         global_buffers: Vec<(String, Bytes)>,
     ) -> Result<()> {
         let num_bitmaps = state.len();
         let schema = Arc::new(Schema::new(vec![
             Field::new("keys", value_type.clone(), true),
-            Field::new("bitmaps", DataType::Binary, true),
+            Field::new("bitmaps", bitmap_type.clone(), true),
         ]));
 
         let mut bitmap_index_file = index_store
@@ -763,13 +866,16 @@ impl BitmapIndexPlugin {
             bitmap.serialize_into(&mut bytes).unwrap();
             let bitmap_size = bytes.len();
 
+            if matches!(bitmap_type, DataType::Binary) && bitmap_size > MAX_BITMAP_ARRAY_LENGTH {
+                return Err(Error::invalid_input(format!(
+                    "Serialized bitmap for value '{key}' is too large for Arrow Binary ({bitmap_size} bytes). \
+                     Set enable_large_bitmaps=true (LargeBinary) to write huge bitmaps."
+                )));
+            }
+
             if cur_bytes + bitmap_size > MAX_BITMAP_ARRAY_LENGTH {
                 let keys_array = ScalarValue::iter_to_array(cur_keys.clone().into_iter()).unwrap();
-                let mut binary_builder = BinaryBuilder::new();
-                for b in &cur_bitmaps {
-                    binary_builder.append_value(b);
-                }
-                let bitmaps_array = Arc::new(binary_builder.finish()) as Arc<dyn Array>;
+                let bitmaps_array = Self::bitmaps_array_from_borrowed(bitmap_type, &cur_bitmaps)?;
 
                 let record_batch = Self::get_batch_from_arrays(keys_array, bitmaps_array)?;
                 bitmap_index_file.write_record_batch(record_batch).await?;
@@ -787,11 +893,7 @@ impl BitmapIndexPlugin {
         // Flush any remaining
         if !cur_keys.is_empty() {
             let keys_array = ScalarValue::iter_to_array(cur_keys).unwrap();
-            let mut binary_builder = BinaryBuilder::new();
-            for b in &cur_bitmaps {
-                binary_builder.append_value(b);
-            }
-            let bitmaps_array = Arc::new(binary_builder.finish()) as Arc<dyn Array>;
+            let bitmaps_array = Self::bitmaps_array_from_borrowed(bitmap_type, &cur_bitmaps)?;
 
             let record_batch = Self::get_batch_from_arrays(keys_array, bitmaps_array)?;
             bitmap_index_file.write_record_batch(record_batch).await?;
@@ -834,7 +936,15 @@ impl BitmapIndexPlugin {
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
     ) -> Result<()> {
-        Self::streaming_build_and_write(data, None, index_store).await
+        Self::train_bitmap_index_with_bitmap_type(data, index_store, DataType::Binary).await
+    }
+
+    pub(crate) async fn train_bitmap_index_with_bitmap_type(
+        data: SendableRecordBatchStream,
+        index_store: &dyn IndexStore,
+        bitmap_type: DataType,
+    ) -> Result<()> {
+        Self::streaming_build_and_write(data, None, index_store, bitmap_type).await
     }
 
     /// Builds and writes a bitmap index in a streaming fashion from value-sorted
@@ -848,18 +958,23 @@ impl BitmapIndexPlugin {
         mut data_source: SendableRecordBatchStream,
         old_index: Option<&BitmapIndex>,
         index_store: &dyn IndexStore,
+        bitmap_type: DataType,
     ) -> Result<()> {
         let value_type = data_source.schema().field(0).data_type().clone();
 
+        let bitmap_type = old_index
+            .map(|idx| idx.bitmap_type.clone())
+            .unwrap_or(bitmap_type);
+
         let schema = Arc::new(Schema::new(vec![
             Field::new("keys", value_type.clone(), true),
-            Field::new("bitmaps", DataType::Binary, true),
+            Field::new("bitmaps", bitmap_type.clone(), true),
         ]));
 
         let index_file = index_store
             .new_index_file(BITMAP_LOOKUP_NAME, schema)
             .await?;
-        let mut writer = BitmapBatchWriter::new(index_file);
+        let mut writer = BitmapBatchWriter::new(index_file, bitmap_type);
 
         // Collect old index keys (already in memory as BTreeMap keys — this is
         // just a Vec of references, not a copy of the bitmaps themselves).
@@ -1030,7 +1145,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
 
     fn new_training_request(
         &self,
-        _params: &str,
+        params: &str,
         field: &Field,
     ) -> Result<Box<dyn TrainingRequest>> {
         if field.data_type().is_nested() {
@@ -1038,9 +1153,14 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
                 "A bitmap index can only be created on a non-nested field.".into(),
             ));
         }
-        Ok(Box::new(DefaultTrainingRequest::new(
-            TrainingCriteria::new(TrainingOrdering::Values).with_row_id(),
-        )))
+
+        let params = if params.is_empty() {
+            BitmapParameters::default()
+        } else {
+            serde_json::from_str::<BitmapParameters>(params)?
+        };
+
+        Ok(Box::new(BitmapTrainingRequest::new(params)))
     }
 
     fn provides_exact_answer(&self) -> bool {
@@ -1063,7 +1183,7 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
         &self,
         data: SendableRecordBatchStream,
         index_store: &dyn IndexStore,
-        _request: Box<dyn TrainingRequest>,
+        request: Box<dyn TrainingRequest>,
         fragment_ids: Option<Vec<u32>>,
         _progress: Arc<dyn crate::progress::IndexBuildProgress>,
     ) -> Result<CreatedIndex> {
@@ -1073,7 +1193,23 @@ impl ScalarIndexPlugin for BitmapIndexPlugin {
             ));
         }
 
-        Self::train_bitmap_index(data, index_store).await?;
+        let request = request
+            .as_any()
+            .downcast_ref::<BitmapTrainingRequest>()
+            .ok_or_else(|| {
+                Error::internal(
+                    "BitmapIndexPlugin::train_index received a non-bitmap training request"
+                        .to_string(),
+                )
+            })?;
+
+        let bitmap_type = if request.parameters.enable_large_bitmaps {
+            DataType::LargeBinary
+        } else {
+            DataType::Binary
+        };
+
+        Self::train_bitmap_index_with_bitmap_type(data, index_store, bitmap_type).await?;
         Ok(CreatedIndex {
             index_details: prost_types::Any::from_msg(&pbold::BitmapIndexDetails::default())
                 .unwrap(),
@@ -1276,6 +1412,179 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_bitmap_large_binary_round_trip() {
+        let tmpdir = TempObjDir::default();
+        let store = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Utf8, false),
+                Field::new("_rowid", DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "red", "blue", "green", "red", "yellow", "blue", "red", "green", "blue",
+                    "yellow", "red", "red", "blue", "green", "yellow",
+                ])),
+                Arc::new(UInt64Array::from((0u64..15u64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+
+        let batch = sort_batch_by_value(&batch);
+        let schema = batch.schema();
+        let stream = stream::once(async move { Ok(batch) });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(schema, stream));
+
+        BitmapIndexPlugin::train_bitmap_index_with_bitmap_type(
+            stream,
+            store.as_ref(),
+            DataType::LargeBinary,
+        )
+        .await
+        .unwrap();
+
+        let reader = store.open_index_file(BITMAP_LOOKUP_NAME).await.unwrap();
+        assert_eq!(reader.schema().fields[1].data_type(), DataType::LargeBinary);
+
+        let index = BitmapIndex::load(store.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+        let query = SargableQuery::Equals(ScalarValue::Utf8(Some("red".to_string())));
+        let result = index.search(&query, &NoOpMetricsCollector).await.unwrap();
+
+        let expected_red_rows = vec![0u64, 3, 6, 10, 11];
+        if let SearchResult::Exact(row_ids) = result {
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
+            actual.sort();
+            assert_eq!(actual, expected_red_rows);
+        } else {
+            panic!("Expected exact search result");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bitmap_update_preserves_large_binary() {
+        let tmpdir1 = TempObjDir::default();
+        let store1 = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir1.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let base_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Utf8, false),
+                Field::new("_rowid", DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "red", "blue", "green", "red", "yellow", "blue", "red", "green", "blue",
+                    "yellow", "red", "red", "blue", "green", "yellow",
+                ])),
+                Arc::new(UInt64Array::from((0u64..15u64).collect::<Vec<_>>())),
+            ],
+        )
+        .unwrap();
+        let base_batch = sort_batch_by_value(&base_batch);
+        let base_schema = base_batch.schema();
+        let base_stream = stream::once(async move { Ok(base_batch) });
+        let base_stream = Box::pin(RecordBatchStreamAdapter::new(base_schema, base_stream));
+
+        BitmapIndexPlugin::train_bitmap_index_with_bitmap_type(
+            base_stream,
+            store1.as_ref(),
+            DataType::LargeBinary,
+        )
+        .await
+        .unwrap();
+
+        let index = BitmapIndex::load(store1.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let tmpdir2 = TempObjDir::default();
+        let store2 = Arc::new(LanceIndexStore::new(
+            Arc::new(ObjectStore::local()),
+            tmpdir2.clone(),
+            Arc::new(LanceCache::no_cache()),
+        ));
+
+        let new_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("value", DataType::Utf8, false),
+                Field::new("_rowid", DataType::UInt64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["red", "purple"])),
+                Arc::new(UInt64Array::from(vec![15u64, 16u64])),
+            ],
+        )
+        .unwrap();
+        let new_batch = sort_batch_by_value(&new_batch);
+        let new_schema = new_batch.schema();
+        let new_stream = stream::once(async move { Ok(new_batch) });
+        let new_stream = Box::pin(RecordBatchStreamAdapter::new(new_schema, new_stream));
+
+        index
+            .update(new_stream, store2.as_ref(), None)
+            .await
+            .unwrap();
+
+        let reader = store2.open_index_file(BITMAP_LOOKUP_NAME).await.unwrap();
+        assert_eq!(reader.schema().fields[1].data_type(), DataType::LargeBinary);
+
+        let index2 = BitmapIndex::load(store2.clone(), None, &LanceCache::no_cache())
+            .await
+            .unwrap();
+
+        let query_red = SargableQuery::Equals(ScalarValue::Utf8(Some("red".to_string())));
+        let result = index2
+            .search(&query_red, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        let expected_red_rows = vec![0u64, 3, 6, 10, 11, 15];
+        if let SearchResult::Exact(row_ids) = result {
+            let mut actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
+            actual.sort();
+            assert_eq!(actual, expected_red_rows);
+        } else {
+            panic!("Expected exact search result");
+        }
+
+        let query_purple = SargableQuery::Equals(ScalarValue::Utf8(Some("purple".to_string())));
+        let result = index2
+            .search(&query_purple, &NoOpMetricsCollector)
+            .await
+            .unwrap();
+        if let SearchResult::Exact(row_ids) = result {
+            let actual: Vec<u64> = row_ids
+                .true_rows()
+                .row_addrs()
+                .unwrap()
+                .map(|id| id.into())
+                .collect();
+            assert_eq!(actual, vec![16u64]);
+        } else {
+            panic!("Expected exact search result");
+        }
+    }
+
+    #[tokio::test]
     #[ignore]
     async fn test_big_bitmap_index() {
         // WARNING: This test allocates a huge state to force overflow over int32 on BinaryArray
@@ -1318,8 +1627,13 @@ mod tests {
 
         // This call should never trigger a "byte array offset overflow" error since now the code supports
         // read by chunks
-        let result =
-            BitmapIndexPlugin::write_bitmap_index(state, &test_store, &DataType::UInt32).await;
+        let result = BitmapIndexPlugin::write_bitmap_index(
+            state,
+            &test_store,
+            &DataType::UInt32,
+            &DataType::Binary,
+        )
+        .await;
 
         assert!(
             result.is_ok(),

@@ -479,6 +479,7 @@ async fn write_label_list_bitmap_index(
         state,
         store,
         value_type,
+        &DataType::Binary,
         HashMap::new(),
         vec![(
             LABEL_LIST_NULLS_METADATA_KEY.to_string(),

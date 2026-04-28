@@ -13,6 +13,11 @@
  */
 package org.lance.index.scalar;
 
+import org.lance.util.JsonUtils;
+
+import java.util.HashMap;
+import java.util.Map;
+
 /** Builder-style configuration for Bitmap scalar index parameters. */
 public final class BitmapIndexParams {
   private static final String INDEX_TYPE = "bitmap";
@@ -25,9 +30,35 @@ public final class BitmapIndexParams {
   }
 
   public static final class Builder {
+    private Boolean enableLargeBitmaps;
+
+    /**
+     * Enable bitmap storage using Arrow LargeBinary to support huge bitmaps.
+     *
+     * <p>When enabled, Lance will write bitmap pages using Arrow LargeBinary so a single bitmap
+     * can exceed the 2GiB Binary limit.
+     *
+     * <p>Compatibility note: bitmap indices written with LargeBinary cannot be read by older
+     * Lance versions that only support Binary.
+     */
+    public Builder enableLargeBitmaps(boolean enableLargeBitmaps) {
+      this.enableLargeBitmaps = enableLargeBitmaps;
+      return this;
+    }
+
     /** Build a {@link ScalarIndexParams} instance for a Bitmap index. */
     public ScalarIndexParams build() {
-      return ScalarIndexParams.create(INDEX_TYPE);
+      Map<String, Object> params = new HashMap<>();
+      if (Boolean.TRUE.equals(enableLargeBitmaps)) {
+        params.put("enable_large_bitmaps", true);
+      }
+
+      if (params.isEmpty()) {
+        return ScalarIndexParams.create(INDEX_TYPE);
+      }
+
+      String json = JsonUtils.toJson(params);
+      return ScalarIndexParams.create(INDEX_TYPE, json);
     }
   }
 }
